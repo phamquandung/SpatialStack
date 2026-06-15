@@ -50,28 +50,23 @@ export LR="${LR:-2e-5}"
 export OUTPUT_DIR="${OUTPUT_DIR:-/mnt/data/vmo-ai-task/dungpq6/model-checkpoint/spatialstack_janus_vln_train}"
 export CACHE_DIR="${CACHE_DIR:-${PROJECT_ROOT}/cache}"
 
+# --- Weights & Biases (offline; sync later with `wandb sync`) ---
+export REPORT_TO="${REPORT_TO:-wandb}"
+export WANDB_MODE="${WANDB_MODE:-offline}"
+export WANDB_DIR="${WANDB_DIR:-${OUTPUT_DIR}/wandb}"
+export WANDB_PROJECT="${WANDB_PROJECT:-spatialstack-janus-vln}"
+export WANDB_RUN_NAME="${WANDB_RUN_NAME:-janus_vln_${SLURM_JOB_ID:-manual}}"
+export WANDB_CACHE_DIR="${WANDB_CACHE_DIR:-${CACHE_DIR}/wandb}"
+export WANDB_SILENT="${WANDB_SILENT:-true}"
+
 # Optional debug (rank-0 dumps to ${OUTPUT_DIR}/debug_vln)
 export VLN_DEBUG="${VLN_DEBUG:-}"
 export VLN_DEBUG_SAVE_INTERVAL="${VLN_DEBUG_SAVE_INTERVAL:-100}"
 
-mkdir -p "${OUTPUT_DIR}" "${CACHE_DIR}"
-
-# Resolve master for torchrun (container may not have scontrol on PATH).
-if [[ "${NUM_NODES}" -gt 1 ]]; then
-    if command -v scontrol >/dev/null 2>&1 && [[ -n "${SLURM_JOB_NODELIST:-}" ]]; then
-        mapfile -t _slurm_nodes < <(scontrol show hostnames "${SLURM_JOB_NODELIST}")
-        export MASTER_ADDR="${MASTER_ADDR:-${_slurm_nodes[0]}}"
-    else
-        export MASTER_ADDR="${MASTER_ADDR:-${SLURM_JOB_NODELIST%%,*}}"
-        export MASTER_ADDR="${MASTER_ADDR//[\[\]]/}"
-    fi
-else
-    export MASTER_ADDR="${MASTER_ADDR:-127.0.0.1}"
-fi
+mkdir -p "${OUTPUT_DIR}" "${CACHE_DIR}" "${WANDB_DIR}" "${WANDB_CACHE_DIR}"
 
 echo "PROJECT_ROOT=${PROJECT_ROOT}"
 echo "NUM_NODES=${NUM_NODES} NPROC_PER_NODE=${NPROC_PER_NODE}"
-echo "MASTER_ADDR=${MASTER_ADDR}"
 echo "MASTER_PORT=${MASTER_PORT}"
 echo "VLN_TRAIN_MODE=${VLN_TRAIN_MODE}"
 echo "VLN_DATA_ROOT=${VLN_DATA_ROOT}"
@@ -81,6 +76,11 @@ echo "GEOMETRY_ENCODER_PATH=${GEOMETRY_ENCODER_PATH}"
 echo "OUTPUT_DIR=${OUTPUT_DIR}"
 echo "TOTAL_BATCH_SIZE=${TOTAL_BATCH_SIZE}"
 echo "DATASETS=${DATASETS}"
+echo "REPORT_TO=${REPORT_TO}"
+echo "WANDB_MODE=${WANDB_MODE}"
+echo "WANDB_PROJECT=${WANDB_PROJECT}"
+echo "WANDB_RUN_NAME=${WANDB_RUN_NAME}"
+echo "WANDB_DIR=${WANDB_DIR}"
 
 if [[ "${NUM_NODES}" -gt 1 ]]; then
     # One task per node; train_janus_vln.sh reads SLURM_PROCID / SLURM_JOB_NUM_NODES for torchrun.

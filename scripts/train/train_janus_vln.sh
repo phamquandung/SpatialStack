@@ -43,12 +43,7 @@ MASTER_ADDR=${MASTER_ADDR:-127.0.0.1}
 MASTER_PORT=${MASTER_PORT:-22223}
 
 if [ -n "${SLURM_JOB_NODELIST:-}" ]; then
-    if command -v scontrol >/dev/null 2>&1; then
-        MASTER_ADDR=$(scontrol show hostnames "$SLURM_JOB_NODELIST" | head -n1)
-    else
-        echo ">>>>> WARNING: SLURM_JOB_NODELIST is set but scontrol is not in PATH."
-        echo ">>>>> Using MASTER_ADDR=${MASTER_ADDR} (set MASTER_ADDR for multi-node, or unset SLURM_JOB_NODELIST for interactive runs)"
-    fi
+    MASTER_ADDR=$(scontrol show hostnames "$SLURM_JOB_NODELIST" | head -n1)
 fi
 
 NODE_RANK=${NODE_RANK:-${SLURM_PROCID:-0}}
@@ -110,6 +105,7 @@ FEATURE_FUSION_METHOD="${FEATURE_FUSION_METHOD:-deepstack_language_add}"
 GEOMETRY_FUSION_LAYERS="${GEOMETRY_FUSION_LAYERS:-0 1 2}"
 GEOMETRY_ENCODER_LAYERS="${GEOMETRY_ENCODER_LAYERS:-11 17 23}"
 REFERENCE_FRAME="${REFERENCE_FRAME:-first}"
+REPORT_TO="${REPORT_TO:-none}"
 
 DATALOADER_NUM_WORKERS="${DATALOADER_NUM_WORKERS:-8}"
 VLN_DEBUG="${VLN_DEBUG:-}"
@@ -155,7 +151,7 @@ train_args=(
     --dataloader_num_workers "$DATALOADER_NUM_WORKERS"
     --group_by_modality_length true
     --seed 42
-    --report_to none
+    --report_to "$REPORT_TO"
     --use_geometry_encoder "$USE_GEOMETRY_ENCODER"
     --geometry_encoder_streaming "$GEOMETRY_ENCODER_STREAMING"
     --reference_frame "$REFERENCE_FRAME"
