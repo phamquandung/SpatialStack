@@ -133,25 +133,52 @@ Training enables it via `--geometry_encoder_streaming True`. The pipeline:
 
 ## Step 4 — Launch training
 
+### Train from Qwen3.5 base (JanusVLN-style, default)
+
+Same idea as JanusVLN `train.sh`: start from **`Qwen/Qwen3.5-4B`**, not the SpatialStack checkpoint. VGGT stays frozen; LLM + projector + geometry fusion modules are trained on VLN data.
+
 ```bash
 cd SpatialStack
 
-# Defaults: annotation=data/train/train_r2r_rxr_extra.json, data root=.
-export MODEL_PATH=Journey9ni/SpatialStack-Qwen3.5-4B
-export OUTPUT_DIR=./output/spatialstack_janus_vln_extra
+export VLN_DATA_ROOT=/mnt/data/vmo-ai-task/anhdh35/JanusVLN
+export VLN_ANNOTATION=/mnt/data/vmo-ai-task/anhdh35/JanusVLN/train_r2r_rxr.json
+export DATASETS=train_r2r_rxr%100
+
+export VLN_TRAIN_MODE=train          # default
+export MODEL_PATH=Qwen/Qwen3.5-4B    # default when VLN_TRAIN_MODE=train
+export OUTPUT_DIR=./output/spatialstack_janus_vln_train
 export TOTAL_BATCH_SIZE=64
 export CUDA_VISIBLE_DEVICES=0,1,2,3
 
 bash scripts/train/train_janus_vln.sh
 ```
 
+### Fine-tune from SpatialStack checkpoint (optional)
+
+If you already have `Journey9ni/SpatialStack-Qwen3.5-4B` (spatial QA pre-trained):
+
+```bash
+export VLN_TRAIN_MODE=finetune
+export MODEL_PATH=Journey9ni/SpatialStack-Qwen3.5-4B
+export OUTPUT_DIR=./output/spatialstack_janus_vln_finetune
+bash scripts/train/train_janus_vln.sh
+```
+
+| `VLN_TRAIN_MODE` | Default `MODEL_PATH` | Use when |
+|------------------|----------------------|----------|
+| `train` (default) | `Qwen/Qwen3.5-4B` | JanusVLN-style VLN training from base VLM |
+| `finetune` | `Journey9ni/SpatialStack-Qwen3.5-4B` | Adapt SpatialStack to VLN after spatial QA training |
+
+Both modes use the same VLN data, streaming VGGT, and `tune_mm_llm=True`, `tune_mm_mlp=True`, `tune_mm_vision=False` (same as JanusVLN).
+
 ### Environment variables
 
 | Variable | Default | Purpose |
 |----------|---------|---------|
+| `VLN_TRAIN_MODE` | `train` | `train` = Qwen3.5 base; `finetune` = SpatialStack checkpoint |
 | `VLN_DATA_ROOT` | `.` | Root for resolving relative image paths in the JSON |
 | `VLN_ANNOTATION` | `data/train/train_r2r_rxr_extra.json` | Training manifest path |
-| `DATASETS` | `janus_vln_extra%100` | Use `janus_vln_base%100` for R2R+RxR only |
+| `DATASETS` | `train_r2r_rxr%100` | Dataset alias; use `train_r2r_rxr_extra%100` for extra set |
 | `GEOMETRY_ENCODER_STREAMING` | `true` | Frame-by-frame VGGT (keep on for VLN) |
 
 ### Key training settings
@@ -341,7 +368,7 @@ python scripts/debug/debug_vln_pipeline.py --sample_idx 0 \
 
 ## Notes
 
-- **Weights**: Start from `Journey9ni/SpatialStack-Qwen3.5-4B` or `Qwen/Qwen3.5-4B`. JanusVLN_Base (Qwen2.5-VL) weights are not compatible.
+- **Weights**: VLN **training** uses `Qwen/Qwen3.5-4B` (default). **Fine-tuning** uses `Journey9ni/SpatialStack-Qwen3.5-4B`. JanusVLN_Base (Qwen2.5-VL) weights are not compatible.
 - **VLN evaluation**: SpatialStack eval benchmarks are spatial-QA, not navigation. For R2R/RxR metrics you need a separate Habitat eval pipeline.
 - **Compute**: Full extra set is multi-million samples; use multi-GPU + DeepSpeed ZeRO-2. Switch to ZeRO-3 if OOM at `model_max_length=163840`.
 

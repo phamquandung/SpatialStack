@@ -1,6 +1,10 @@
 #!/bin/bash
-# Fine-tune SpatialStack (Qwen3.5) on JanusVLN VLN data.
+# Train or fine-tune SpatialStack (Qwen3.5) on JanusVLN VLN data.
 # Upload only SpatialStack to the server — streaming VGGT and data-prep script are bundled.
+#
+# Modes (set VLN_TRAIN_MODE):
+#   train    — JanusVLN-style: start from Qwen/Qwen3.5-4B + VGGT (default)
+#   finetune — continue from Journey9ni/SpatialStack-Qwen3.5-4B
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
@@ -60,13 +64,28 @@ WORLD_SIZE=$((NPROC_PER_NODE * NNODES))
 export WORLD_SIZE NODE_RANK
 
 # ======================
-# Model paths
+# Model paths (train vs finetune)
 # ======================
-MODEL_PATH="${MODEL_PATH:-Journey9ni/SpatialStack-Qwen3.5-4B}"
+VLN_TRAIN_MODE="${VLN_TRAIN_MODE:-train}"
+VLN_TRAIN_MODE="${VLN_TRAIN_MODE,,}"
+
+if [[ "$VLN_TRAIN_MODE" == "finetune" ]]; then
+    MODEL_PATH="${MODEL_PATH:-Journey9ni/SpatialStack-Qwen3.5-4B}"
+    OUTPUT_DIR="${OUTPUT_DIR:-./output/spatialstack_janus_vln_finetune}"
+else
+    if [[ "$VLN_TRAIN_MODE" != "train" ]]; then
+        echo "WARNING: unknown VLN_TRAIN_MODE='$VLN_TRAIN_MODE', using train (Qwen3.5 base)"
+    fi
+    MODEL_PATH="${MODEL_PATH:-/mnt/data/vmo-ai-task/dungpq6/model-checkpoint/Qwen3.5-4B}"
+    OUTPUT_DIR="${OUTPUT_DIR:-/mnt/data/vmo-ai-task/dungpq6/model-checkpoint/spatialstack_janus_vln_train}"
+fi
+
 GEOMETRY_ENCODER_PATH="${GEOMETRY_ENCODER_PATH:-facebook/VGGT-1B}"
-OUTPUT_DIR="${OUTPUT_DIR:-./output/spatialstack_janus_vln_extra}"
 CACHE_DIR="${CACHE_DIR:-./cache}"
 mkdir -p "$OUTPUT_DIR"
+
+echo ">>>>> VLN_TRAIN_MODE: $VLN_TRAIN_MODE"
+echo ">>>>> MODEL_PATH:      $MODEL_PATH"
 
 # ======================
 # Hyperparameters (VLN-tuned)
@@ -79,7 +98,7 @@ echo ">>>>> VLN annotation: $ANNOTATION_FILE"
 echo ">>>>> VLN data root:    $VLN_DATA_ROOT"
 echo ">>>>> grad accum = $GRADIENT_ACCUMULATION_STEPS  (world_size=$WORLD_SIZE)"
 
-DATASETS="${DATASETS:-janus_vln_extra%100}"
+DATASETS="${DATASETS:-train_r2r_rxr%100}"
 USE_GEOMETRY_ENCODER="${USE_GEOMETRY_ENCODER:-true}"
 GEOMETRY_ENCODER_STREAMING="${GEOMETRY_ENCODER_STREAMING:-true}"
 FEATURE_FUSION_METHOD="${FEATURE_FUSION_METHOD:-deepstack_language_add}"
