@@ -80,7 +80,7 @@ else
     OUTPUT_DIR="${OUTPUT_DIR:-/mnt/data/vmo-ai-task/dungpq6/model-checkpoint/spatialstack_janus_vln_train}"
 fi
 
-GEOMETRY_ENCODER_PATH="${GEOMETRY_ENCODER_PATH:-facebook/VGGT-1B}"
+GEOMETRY_ENCODER_PATH="${GEOMETRY_ENCODER_PATH:-/mnt/data/vmo-ai-task/dungpq6/model-checkpoint/VGGT-1B}"
 CACHE_DIR="${CACHE_DIR:-./cache}"
 mkdir -p "$OUTPUT_DIR"
 
