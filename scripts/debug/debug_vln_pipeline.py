@@ -212,8 +212,8 @@ def main():
     parser.add_argument("--data_root", default=None, help="Override VLN_DATA_ROOT")
     parser.add_argument("--out_dir", default="./debug_vln_output")
     parser.add_argument("--run_forward", action="store_true")
-    parser.add_argument("--model_path", default="Journey9ni/SpatialStack-Qwen3.5-4B")
-    parser.add_argument("--geometry_encoder_path", default="facebook/VGGT-1B")
+    parser.add_argument("--model_path", default="/mnt/data/vmo-ai-task/dungpq6/model-checkpoint/Qwen3.5-4B}")
+    parser.add_argument("--geometry_encoder_path", default="/mnt/data/vmo-ai-task/dungpq6/model-checkpoint/VGGT-1B")
     args = parser.parse_args()
 
     if args.data_root:
