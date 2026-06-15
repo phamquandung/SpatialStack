@@ -43,7 +43,12 @@ MASTER_ADDR=${MASTER_ADDR:-127.0.0.1}
 MASTER_PORT=${MASTER_PORT:-22223}
 
 if [ -n "${SLURM_JOB_NODELIST:-}" ]; then
-    MASTER_ADDR=$(scontrol show hostnames "$SLURM_JOB_NODELIST" | head -n1)
+    if command -v scontrol >/dev/null 2>&1; then
+        MASTER_ADDR=$(scontrol show hostnames "$SLURM_JOB_NODELIST" | head -n1)
+    else
+        echo ">>>>> WARNING: SLURM_JOB_NODELIST is set but scontrol is not in PATH."
+        echo ">>>>> Using MASTER_ADDR=${MASTER_ADDR} (set MASTER_ADDR for multi-node, or unset SLURM_JOB_NODELIST for interactive runs)"
+    fi
 fi
 
 NODE_RANK=${NODE_RANK:-${SLURM_PROCID:-0}}
@@ -107,7 +112,9 @@ GEOMETRY_ENCODER_LAYERS="${GEOMETRY_ENCODER_LAYERS:-11 17 23}"
 REFERENCE_FRAME="${REFERENCE_FRAME:-first}"
 
 DATALOADER_NUM_WORKERS="${DATALOADER_NUM_WORKERS:-8}"
-if [[ "${VLN_DEBUG:-}" == "1" || "${VLN_DEBUG,,}" == "true" ]]; then
+VLN_DEBUG="${VLN_DEBUG:-}"
+VLN_DEBUG_DEPTH="${VLN_DEBUG_DEPTH:-}"
+if [[ "$VLN_DEBUG" == "1" || "${VLN_DEBUG,,}" == "true" ]]; then
     DATALOADER_NUM_WORKERS=0
     echo ">>>>> VLN_DEBUG=1: logging shapes + saving frames to ${OUTPUT_DIR}/debug_vln"
 fi
@@ -164,14 +171,14 @@ if [[ "${USE_GEOMETRY_ENCODER,,}" == "true" ]]; then
     )
 fi
 
-if [[ "${VLN_DEBUG:-}" == "1" || "${VLN_DEBUG,,}" == "true" ]]; then
+if [[ "$VLN_DEBUG" == "1" || "${VLN_DEBUG,,}" == "true" ]]; then
     train_args+=(
         --debug_vln True
         --debug_vln_save_dir "${OUTPUT_DIR}/debug_vln"
         --debug_vln_save_interval "${VLN_DEBUG_SAVE_INTERVAL:-100}"
         --debug_vln_save_geo_layers True
     )
-    if [[ "${VLN_DEBUG_DEPTH:-}" == "1" || "${VLN_DEBUG_DEPTH,,}" == "true" ]]; then
+    if [[ "$VLN_DEBUG_DEPTH" == "1" || "${VLN_DEBUG_DEPTH,,}" == "true" ]]; then
         train_args+=( --debug_vln_save_depth True )
         echo ">>>>> VLN_DEBUG_DEPTH=1: will run VGGT DPT depth head (extra forward)"
     fi

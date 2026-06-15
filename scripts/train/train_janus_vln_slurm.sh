@@ -56,8 +56,22 @@ export VLN_DEBUG_SAVE_INTERVAL="${VLN_DEBUG_SAVE_INTERVAL:-100}"
 
 mkdir -p "${OUTPUT_DIR}" "${CACHE_DIR}"
 
+# Resolve master for torchrun (container may not have scontrol on PATH).
+if [[ "${NUM_NODES}" -gt 1 ]]; then
+    if command -v scontrol >/dev/null 2>&1 && [[ -n "${SLURM_JOB_NODELIST:-}" ]]; then
+        mapfile -t _slurm_nodes < <(scontrol show hostnames "${SLURM_JOB_NODELIST}")
+        export MASTER_ADDR="${MASTER_ADDR:-${_slurm_nodes[0]}}"
+    else
+        export MASTER_ADDR="${MASTER_ADDR:-${SLURM_JOB_NODELIST%%,*}}"
+        export MASTER_ADDR="${MASTER_ADDR//[\[\]]/}"
+    fi
+else
+    export MASTER_ADDR="${MASTER_ADDR:-127.0.0.1}"
+fi
+
 echo "PROJECT_ROOT=${PROJECT_ROOT}"
 echo "NUM_NODES=${NUM_NODES} NPROC_PER_NODE=${NPROC_PER_NODE}"
+echo "MASTER_ADDR=${MASTER_ADDR}"
 echo "MASTER_PORT=${MASTER_PORT}"
 echo "VLN_TRAIN_MODE=${VLN_TRAIN_MODE}"
 echo "VLN_DATA_ROOT=${VLN_DATA_ROOT}"
