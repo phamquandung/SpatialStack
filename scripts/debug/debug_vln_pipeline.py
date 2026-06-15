@@ -9,11 +9,18 @@ Examples (from SpatialStack repo root):
 
   # Run one collated batch + optional model forward
   python scripts/debug/debug_vln_pipeline.py --sample_idx 0 --run_forward \
-      --model_path Journey9ni/SpatialStack-Qwen3.5-4B
+      --model_path Qwen/Qwen3.5-4B
+
+  # Local checkpoints on server:
+  python scripts/debug/debug_vln_pipeline.py --sample_idx 0 --run_forward \
+      --model_path /mnt/data/vmo-ai-task/dungpq6/model-checkpoint/Qwen3.5-4B \
+      --geometry_encoder_path /mnt/data/vmo-ai-task/dungpq6/model-checkpoint/VGGT-1B
 
 Env (same as training):
   export VLN_DATA_ROOT=.
   export VLN_ANNOTATION=data/train/train_r2r_rxr_extra.json
+  export MODEL_PATH=/path/to/Qwen3.5-4B
+  export GEOMETRY_ENCODER_PATH=/path/to/VGGT-1B
 """
 
 from __future__ import annotations
@@ -207,14 +214,25 @@ def run_forward(batch, model_path: str, geometry_encoder_path: str):
 def main():
     parser = argparse.ArgumentParser(description="Debug VLN training pipeline")
     parser.add_argument("--sample_idx", type=int, default=0)
-    parser.add_argument("--dataset", default="janus_vln_extra")
+    parser.add_argument("--dataset", default="train_r2r_rxr")
     parser.add_argument("--annotation", default=None, help="Override VLN_ANNOTATION path")
     parser.add_argument("--data_root", default=None, help="Override VLN_DATA_ROOT")
     parser.add_argument("--out_dir", default="./debug_vln_output")
     parser.add_argument("--run_forward", action="store_true")
-    parser.add_argument("--model_path", default="/mnt/data/vmo-ai-task/dungpq6/model-checkpoint/Qwen3.5-4B}")
-    parser.add_argument("--geometry_encoder_path", default="/mnt/data/vmo-ai-task/dungpq6/model-checkpoint/VGGT-1B")
+    parser.add_argument("--model_path", default=None, help="Default: MODEL_PATH env or Qwen/Qwen3.5-4B")
+    parser.add_argument(
+        "--geometry_encoder_path",
+        default=None,
+        help="Default: GEOMETRY_ENCODER_PATH env or facebook/VGGT-1B",
+    )
     args = parser.parse_args()
+
+    args.model_path = args.model_path or os.environ.get("MODEL_PATH", "Qwen/Qwen3.5-4B")
+    args.geometry_encoder_path = args.geometry_encoder_path or os.environ.get(
+        "GEOMETRY_ENCODER_PATH", "facebook/VGGT-1B"
+    )
+    print(f"model_path: {args.model_path}")
+    print(f"geometry_encoder_path: {args.geometry_encoder_path}")
 
     if args.data_root:
         os.environ["VLN_DATA_ROOT"] = args.data_root
