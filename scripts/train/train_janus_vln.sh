@@ -10,8 +10,8 @@ cd "$SPATIAL_ROOT"
 # ======================
 # Data paths (relative to SpatialStack root by default)
 # ======================
-export VLN_DATA_ROOT="${VLN_DATA_ROOT:-.}"
-export VLN_ANNOTATION="${VLN_ANNOTATION:-data/train/train_r2r_rxr_extra.json}"
+export VLN_DATA_ROOT="${VLN_DATA_ROOT:-/mnt/data/vmo-ai-task/anhdh35/JanusVLN}"
+export VLN_ANNOTATION="${VLN_ANNOTATION:-/mnt/data/vmo-ai-task/anhdh35/JanusVLN/train_r2r_rxr.json}"
 
 if [[ "$VLN_ANNOTATION" != /* ]]; then
     ANNOTATION_FILE="$SPATIAL_ROOT/$VLN_ANNOTATION"
