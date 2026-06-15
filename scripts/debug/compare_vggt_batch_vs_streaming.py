@@ -95,7 +95,7 @@ def _compare_tensors(label: str, a: torch.Tensor, b: torch.Tensor, atol: float, 
 
 def main():
     parser = argparse.ArgumentParser(description="Compare VGGT batch vs streaming KV cache")
-    parser.add_argument("--geometry_encoder_path", default="facebook/VGGT-1B")
+    parser.add_argument("--geometry_encoder_path", default="/mnt/data/vmo-ai-task/dungpq6/model-checkpoint/VGGT-1B")
     parser.add_argument("--num_frames", type=int, default=3)
     parser.add_argument("--layer_indices", type=int, nargs="+", default=[11, 17, 23])
     parser.add_argument("--atol", type=float, default=1e-3)
