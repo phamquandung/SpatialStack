@@ -163,8 +163,8 @@ def prepare_image_inputs(
     if geometry_encoder_streaming:
         from qwen_vl.model.vggt.utils.load_fn import load_and_preprocess_images as vggt_load
         images = vggt_load([image])
-        # Full 644px VGGT tensor — captured before Qwen grid trim (JanusVLN-style).
-        geometry_encoder_inputs = copy.deepcopy(images[0])
+        # Placeholder; resized to Qwen grid after image_processor (below).
+        geometry_encoder_inputs = None
     else:
         images = load_and_preprocess_images([image])
         geometry_encoder_inputs = None
@@ -183,18 +183,18 @@ def prepare_image_inputs(
     image_tensor = visual_processed["pixel_values"]
     grid_thw = visual_processed["image_grid_thw"]
 
-    if not geometry_encoder_streaming:
-        if model_type == "qwen3.5":
-            rgb_image = _load_rgb_image(image)
-            _, grid_h, grid_w = grid_thw[0].tolist()
-            geometry_width = grid_w * GEOMETRY_ENCODER_PATCH_SIZE
-            geometry_height = grid_h * GEOMETRY_ENCODER_PATCH_SIZE
-            geometry_image = rgb_image.resize(
-                (geometry_width, geometry_height), Image.Resampling.BICUBIC
-            )
-            geometry_encoder_inputs = TF.ToTensor()(geometry_image)
-        else:
-            geometry_encoder_inputs = copy.deepcopy(images[0])
+    if geometry_encoder_streaming or model_type == "qwen3.5":
+        # Resize geometry to the Qwen patch grid so VGGT merged tokens tile to vision tokens.
+        _, grid_h, grid_w = grid_thw[0].tolist()
+        geometry_width = int(grid_w) * GEOMETRY_ENCODER_PATCH_SIZE
+        geometry_height = int(grid_h) * GEOMETRY_ENCODER_PATCH_SIZE
+        rgb_image = _load_rgb_image(image)
+        geometry_image = rgb_image.resize(
+            (geometry_width, geometry_height), Image.Resampling.BICUBIC
+        )
+        geometry_encoder_inputs = TF.ToTensor()(geometry_image)
+    else:
+        geometry_encoder_inputs = copy.deepcopy(images[0])
 
     return {
         "pixel_values": image_tensor,

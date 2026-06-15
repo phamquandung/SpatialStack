@@ -127,7 +127,8 @@ bash scripts/verify_streaming_vggt.sh
 
 Training enables it via `--geometry_encoder_streaming True`. The pipeline:
 
-1. Each VLN frame is preprocessed at **644px** for VGGT (full size, before Qwen grid trim).
+1. Each VLN frame is resized to **644px width** for Qwen’s visual path (`vggt_load`), then trimmed to the Qwen patch grid.
+2. VGGT geometry inputs are resized to **`grid_h×14` by `grid_w×14`** (same spatial grid as Qwen vision tokens) so deepstack fusion tiling matches.
 2. Frames are fed **sequentially** through the aggregator with `use_cache=True`.
 3. Geometry from the **last frame** (with history in KV cache) is **tiled** across all image tokens in the prompt (history + current), matching JanusVLN behavior.
 
@@ -359,7 +360,8 @@ python scripts/debug/debug_vln_pipeline.py --sample_idx 0 \
 
 | Check | Expected |
 |-------|----------|
-| VGGT image size | ~644px width, saved as `vggt_644.png` |
+| VGGT image size | `grid_h×14` × `grid_w×14` (matches Qwen grid), saved as `vggt_644.png` in debug dumps |
+| Tiling check | `vision tokens == geo merged` per frame (e.g. 300 == 300 for one image) |
 | Qwen image | Smaller trimmed tensor, `qwen.png` |
 | `geometry_encoder_inputs` stack | `[S, 3, H, W]` with S = number of `<image>` tokens |
 | Tiling factor | Equals S (e.g. 9 for full history) |

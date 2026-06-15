@@ -61,6 +61,20 @@ def _decode_labels(tokenizer, labels: torch.Tensor) -> str:
     return tokenizer.decode(ids, skip_special_tokens=False)
 
 
+def _geo_merged_positions(
+    height: int,
+    width: int,
+    patch_size: int = 14,
+    spatial_merge_size: int = 2,
+) -> int:
+    """Match VGGTEncoder.encode_layers[_streaming] merge + tiling math."""
+    h_patch = height // patch_size
+    w_patch = width // patch_size
+    trimmed_h = (h_patch // spatial_merge_size) * spatial_merge_size or h_patch
+    trimmed_w = (w_patch // spatial_merge_size) * spatial_merge_size or w_patch
+    return (trimmed_h * trimmed_w) // (spatial_merge_size * spatial_merge_size)
+
+
 def _image_paths(sample: dict) -> list:
     if "image" in sample:
         paths = sample["image"]
@@ -137,6 +151,22 @@ def inspect_dataset_sample(dataset: LazySupervisedDataset, tokenizer, idx: int, 
     return item
 
 
+def _check_prepare_image_inputs_version() -> None:
+    """Warn if the server copy is missing grid-aligned VGGT geometry resize."""
+    import inspect
+    from qwen_vl.data import utils as data_utils
+
+    src = inspect.getsource(data_utils.prepare_image_inputs)
+    if "Resize geometry to the Qwen patch grid" not in src:
+        print(
+            "WARNING: outdated src/qwen_vl/data/utils.py on this machine — "
+            "geometry is still full 644px and training will fail at fusion. "
+            "Sync the latest SpatialStack repo, then re-run."
+        )
+    else:
+        print("prepare_image_inputs: grid-aligned VGGT geometry (OK)")
+
+
 def inspect_batch(collator, items, tokenizer, out_dir: Path):
     print("\n=== Collated batch ===")
     batch = collator(items)
@@ -156,12 +186,12 @@ def inspect_batch(collator, items, tokenizer, out_dir: Path):
     if "geometry_encoder_inputs" in batch:
         geo = batch["geometry_encoder_inputs"][0]
         print(f"streaming input [S,C,H,W]: {tuple(geo.shape)}")
-        n_geo = geo.shape[0]
         h, w = geo.shape[-2], geo.shape[-1]
-        h_patch, w_patch = h // 14, w // 14
-        m = 2
-        n_geo_merged = (h_patch // m) * (w_patch // m)
-        print(f"VGGT patches: {h_patch}x{w_patch} -> merged positions ~{n_geo_merged}")
+        merge_size = 2
+        if collator.data_args is not None:
+            merge_size = getattr(collator.data_args.image_processor, "merge_size", 2)
+        n_geo_merged = _geo_merged_positions(h, w, spatial_merge_size=merge_size)
+        print(f"VGGT merged positions (per frame): {n_geo_merged}")
 
     if "image_grid_thw" in batch:
         thw = batch["image_grid_thw"]
@@ -173,9 +203,24 @@ def inspect_batch(collator, items, tokenizer, out_dir: Path):
         if "geometry_encoder_inputs" in batch:
             geo = batch["geometry_encoder_inputs"][0]
             h, w = geo.shape[-2], geo.shape[-1]
-            n_geo_merged = (h // 14 // 2) * (w // 14 // 2)
-            if n_vis % n_geo_merged == 0:
-                print(f"tiling factor (vision/geo): {n_vis // n_geo_merged}  (expect = num frames)")
+            n_frames = int(geo.shape[0])
+            n_geo_merged = _geo_merged_positions(h, w, spatial_merge_size=merge_size)
+            per_frame_vis = n_vis // n_frames if n_frames else n_vis
+            if per_frame_vis == n_geo_merged:
+                print(
+                    f"tiling OK: {n_frames} frame(s), "
+                    f"{per_frame_vis} vision == {n_geo_merged} geo merged per frame"
+                )
+            elif n_vis % n_geo_merged == 0:
+                factor = n_vis // n_geo_merged
+                print(
+                    f"tiling factor (vision/geo): {factor}  "
+                    f"(expect = num frames {n_frames})"
+                )
+                if factor != n_frames:
+                    print(
+                        f"WARNING: tiling factor {factor} != num frames {n_frames}"
+                    )
             else:
                 print(
                     f"WARNING: vision tokens ({n_vis}) not divisible by geo merged ({n_geo_merged}) — "
@@ -244,7 +289,7 @@ def main():
     parser.add_argument("--annotation", default=None, help="Override VLN_ANNOTATION path")
     parser.add_argument("--data_root", default=None, help="Override VLN_DATA_ROOT")
     parser.add_argument("--out_dir", default="./debug_vln_output")
-    parser.add_argument("--max_samples", type=int, default=32, help="Limit JSON rows loaded (faster debug)")
+    parser.add_argument("--max_samples", type=int, default=128, help="Limit JSON rows loaded (faster debug)")
     parser.add_argument("--seed", type=int, default=0, help="RNG seed before dataset shuffle")
     parser.add_argument("--run_forward", action="store_true")
     parser.add_argument("--model_path", default=None, help="Default: MODEL_PATH env or Qwen/Qwen3.5-4B")
@@ -261,6 +306,7 @@ def main():
     )
     print(f"model_path: {args.model_path}")
     print(f"geometry_encoder_path: {args.geometry_encoder_path}")
+    _check_prepare_image_inputs_version()
 
     if args.data_root:
         os.environ["VLN_DATA_ROOT"] = args.data_root
