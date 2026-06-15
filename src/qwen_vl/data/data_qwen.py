@@ -228,6 +228,8 @@ class LazySupervisedDataset(Dataset):
                 annotations = read_jsonl(data["annotation_path"], max_samples=data_args.max_samples)
             else:
                 annotations = json.load(open(data["annotation_path"], "r"))
+            if data_args.max_samples is not None and data_args.max_samples > 0:
+                annotations = annotations[: data_args.max_samples]
             sampling_rate = data.get("sampling_rate", 1.0)
             if sampling_rate < 1.0:
                 annotations = random.sample(
@@ -243,7 +245,8 @@ class LazySupervisedDataset(Dataset):
 
         print(f"Total training samples: {len(list_data_dict)}")
 
-        random.shuffle(list_data_dict)  # Randomly shuffle the data for training
+        if getattr(data_args, "shuffle", True):
+            random.shuffle(list_data_dict)  # Randomly shuffle the data for training
 
         print("Formatting inputs...Skip in lazy mode")
         self.tokenizer = tokenizer

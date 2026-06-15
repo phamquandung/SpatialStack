@@ -61,13 +61,40 @@ def _decode_labels(tokenizer, labels: torch.Tensor) -> str:
     return tokenizer.decode(ids, skip_special_tokens=False)
 
 
-def inspect_raw_sample(annotation_path: str, sample_idx: int) -> dict:
-    with open(annotation_path, encoding="utf-8") as f:
-        data = json.load(f)
-    sample = data[sample_idx]
-    print("\n=== Raw JSON sample ===")
+def _image_paths(sample: dict) -> list:
+    if "image" in sample:
+        paths = sample["image"]
+    elif "images" in sample:
+        paths = sample["images"]
+    else:
+        return []
+    if isinstance(paths, str):
+        return [paths]
+    return list(paths)
+
+
+def _image_count(sample: dict) -> int:
+    return len(_image_paths(sample))
+
+
+def _stack_grid_thw(grid_thw) -> torch.Tensor:
+    if isinstance(grid_thw, torch.Tensor):
+        return grid_thw
+    if isinstance(grid_thw, list):
+        return torch.stack(grid_thw, dim=0)
+    raise TypeError(f"image_grid_thw must be a tensor or list of tensors, got {type(grid_thw)}")
+
+
+def _vision_tokens_per_image(grid_thw, merge_size: int) -> list[int]:
+    thw = _stack_grid_thw(grid_thw)
+    merge = merge_size * merge_size
+    return (thw.prod(dim=-1) // merge).tolist()
+
+
+def inspect_raw_sample(sample: dict) -> dict:
+    print("\n=== Raw dataset entry (list_data_dict[sample_idx]) ===")
     print(f"id: {sample.get('id')}")
-    print(f"num images: {len(sample.get('images', sample.get('image', [])))}")
+    print(f"num images: {_image_count(sample)}")
     print(f"human (first 200 chars): {sample['conversations'][0]['value'][:200]}...")
     print(f"label: {sample['conversations'][1]['value']}")
     return sample
@@ -85,9 +112,7 @@ def inspect_dataset_sample(dataset: LazySupervisedDataset, tokenizer, idx: int, 
     print(f"image_grid_thw:\n{item['image_grid_thw']}")
 
     merge_size = getattr(dataset.data_args.image_processor, "merge_size", 2)
-    tokens_per_image = (
-        item["image_grid_thw"].prod(dim=-1) // (merge_size * merge_size)
-    ).tolist()
+    tokens_per_image = _vision_tokens_per_image(item["image_grid_thw"], merge_size)
     print(f"Qwen tokens per image (grid.prod/merge^2): {tokens_per_image}")
     print(f"total vision tokens: {sum(tokens_per_image)}")
 
@@ -101,9 +126,7 @@ def inspect_dataset_sample(dataset: LazySupervisedDataset, tokenizer, idx: int, 
 
     out_dir.mkdir(parents=True, exist_ok=True)
     data_root = raw.get("data_path", ".")
-    image_paths = raw.get("images", raw.get("image", []))
-    if isinstance(image_paths, str):
-        image_paths = [image_paths]
+    image_paths = _image_paths(raw)
     for i, rel in enumerate(image_paths):
         src = rel if os.path.isabs(rel) else os.path.join(data_root, rel)
         if os.path.isfile(src):
@@ -142,7 +165,10 @@ def inspect_batch(collator, items, tokenizer, out_dir: Path):
 
     if "image_grid_thw" in batch:
         thw = batch["image_grid_thw"]
-        n_vis = sum((thw[i].prod() // 4).item() for i in range(thw.shape[0]))
+        merge_size = 2
+        if collator.data_args is not None:
+            merge_size = getattr(collator.data_args.image_processor, "merge_size", 2)
+        n_vis = sum(_vision_tokens_per_image(thw, merge_size))
         print(f"approx total Qwen vision tokens: {n_vis}")
         if "geometry_encoder_inputs" in batch:
             geo = batch["geometry_encoder_inputs"][0]
@@ -218,6 +244,8 @@ def main():
     parser.add_argument("--annotation", default=None, help="Override VLN_ANNOTATION path")
     parser.add_argument("--data_root", default=None, help="Override VLN_DATA_ROOT")
     parser.add_argument("--out_dir", default="./debug_vln_output")
+    parser.add_argument("--max_samples", type=int, default=32, help="Limit JSON rows loaded (faster debug)")
+    parser.add_argument("--seed", type=int, default=0, help="RNG seed before dataset shuffle")
     parser.add_argument("--run_forward", action="store_true")
     parser.add_argument("--model_path", default=None, help="Default: MODEL_PATH env or Qwen/Qwen3.5-4B")
     parser.add_argument(
@@ -240,11 +268,6 @@ def main():
         os.environ["VLN_ANNOTATION"] = args.annotation
 
     out_dir = Path(args.out_dir)
-    ann_path = os.environ.get("VLN_ANNOTATION", "data/train/train_r2r_rxr_extra.json")
-    if not Path(ann_path).is_absolute():
-        ann_path = str(REPO_ROOT / ann_path)
-
-    inspect_raw_sample(ann_path, args.sample_idx)
 
     model_args = ModelArguments(
         model_name_or_path=args.model_path,
@@ -253,7 +276,8 @@ def main():
     )
     data_args = DataArguments(
         dataset_use=args.dataset,
-        max_samples=10,
+        max_samples=args.max_samples,
+        shuffle=False,
     )
     data_args.use_geometry_encoder = True
     data_args.geometry_encoder_streaming = True
@@ -269,10 +293,20 @@ def main():
         args.model_path, trust_remote_code=True, use_fast=False
     )
 
+    import random
+
+    random.seed(args.seed)
+
     dataset = LazySupervisedDataset(tokenizer=tokenizer, data_args=data_args)
+    if args.sample_idx >= len(dataset):
+        raise IndexError(
+            f"sample_idx={args.sample_idx} out of range (loaded {len(dataset)} samples; "
+            f"increase --max_samples or lower --sample_idx)"
+        )
+    inspect_raw_sample(dataset.list_data_dict[args.sample_idx])
     item = inspect_dataset_sample(dataset, tokenizer, args.sample_idx, out_dir / "frames")
 
-    collator = DataCollatorForSupervisedDataset(tokenizer=tokenizer)
+    collator = DataCollatorForSupervisedDataset(tokenizer=tokenizer, data_args=data_args)
     batch = inspect_batch(collator, [item], tokenizer, out_dir)
 
     if args.run_forward:
