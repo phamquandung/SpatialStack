@@ -136,6 +136,20 @@ JANUS_VLN_BASE = {
     "tag": "3d",
 }
 
+# JanusVLN-compatible names (same JSON layout; paths via VLN_DATA_ROOT / VLN_ANNOTATION)
+TRAIN_R2R_RXR = {
+    "annotation_path": "/mnt/data/vmo-ai-task/anhdh35/JanusVLN/train_r2r_rxr.json",
+    "data_path": "/mnt/data/vmo-ai-task/anhdh35/JanusVLN",
+    "tag": "3d",
+}
+
+TRAIN_R2R_RXR_EXTRA = {
+    "annotation_path": _VLN_ANNOTATION_OVERRIDE
+    or os.path.join(_VLN_DATA_ROOT, "train_r2r_rxr_extra.json"),
+    "data_path": _VLN_DATA_ROOT,
+    "tag": "3d",
+}
+
 data_dict = {
     "cambrian_737k": CAMBRIAN_737K,
     "mp_doc": MP_DOC,
@@ -152,6 +166,8 @@ data_dict = {
     "vsi_appr_order": VSI_APPR_ORDER,
     "janus_vln_extra": JANUS_VLN_EXTRA,
     "janus_vln_base": JANUS_VLN_BASE,
+    "train_r2r_rxr": TRAIN_R2R_RXR,
+    "train_r2r_rxr_extra": TRAIN_R2R_RXR_EXTRA,
 }
 
 

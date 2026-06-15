@@ -69,6 +69,54 @@ for p in s["images"]:
 print("OK", s["id"], len(s["images"]), "frames")
 ```
 
+## Using an existing JanusVLN JSON (your server layout)
+
+If you already have JanusVLN-style data (same as `TRAIN_R2R_RxR` in JanusVLN):
+
+```python
+TRAIN_R2R_RxR = {
+    "annotation_path": "/mnt/data/vmo-ai-task/anhdh35/JanusVLN/train_r2r_rxr.json",
+    "data_path": "/mnt/data/vmo-ai-task/anhdh35/JanusVLN",
+    "tag": "train_r2r_rxr",
+}
+```
+
+**No need to copy JSON into SpatialStack** — set env vars and train:
+
+```bash
+export VLN_DATA_ROOT=/mnt/data/vmo-ai-task/anhdh35/JanusVLN
+export VLN_ANNOTATION=/mnt/data/vmo-ai-task/anhdh35/JanusVLN/train_r2r_rxr.json
+
+# JanusVLN-compatible dataset name
+export DATASETS=train_r2r_rxr%100
+
+bash scripts/train/train_janus_vln.sh
+```
+
+Equivalent names:
+
+| JanusVLN `DATASETS` | SpatialStack alias |
+|---------------------|-------------------|
+| `train_r2r_rxr` | `train_r2r_rxr` or `janus_vln_base` |
+| `train_r2r_rxr_extra` | `train_r2r_rxr_extra` or `janus_vln_extra` |
+
+`tag` in JSON config (`train_r2r_rxr` vs `3d`) only affects length grouping; SpatialStack uses `tag: 3d` internally — both work for VLN-only training.
+
+**Sanity check** (image paths in JSON must resolve under `data_path`):
+
+```bash
+python -c "
+import json, os
+root = '/mnt/data/vmo-ai-task/anhdh35/JanusVLN'
+ann = root + '/train_r2r_rxr.json'
+s = json.load(open(ann))[0]
+for p in s['images']:
+    fp = p if os.path.isabs(p) else os.path.join(root, p)
+    assert os.path.isfile(fp), fp
+print('OK', s['id'], len(s['images']), 'frames')
+"
+```
+
 ## Step 3 — Streaming VGGT (built-in)
 
 SpatialStack bundles **streaming VGGT** under `src/qwen_vl/model/vggt/` (KV-cache aggregator, 644px `load_fn.py`). No JanusVLN checkout or setup script is required.
