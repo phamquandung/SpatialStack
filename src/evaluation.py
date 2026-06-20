@@ -238,14 +238,30 @@ class SpatialStackVLN_Inference:
                 stacklevel=2,
             )
 
-        self.tokenizer = AutoTokenizer.from_pretrained(pretrained, padding_side="left", trust_remote_code=True)
-        self.processor = AutoProcessor.from_pretrained(
-            pretrained,
-            max_pixels=MAX_PIXELS,
-            min_pixels=MIN_PIXELS,
-            padding_side="left",
-            trust_remote_code=True,
-        )
+        # Intermediate training checkpoints save the model + tokenizer but NOT the
+        # image/video processor configs. Allow PROCESSOR_PATH (base model or a full
+        # checkpoint) to supply tokenizer/processor while weights come from `pretrained`.
+        proc_src = os.environ.get("PROCESSOR_PATH") or pretrained
+        try:
+            self.tokenizer = AutoTokenizer.from_pretrained(pretrained, padding_side="left", trust_remote_code=True)
+        except Exception:
+            self.tokenizer = AutoTokenizer.from_pretrained(proc_src, padding_side="left", trust_remote_code=True)
+        try:
+            self.processor = AutoProcessor.from_pretrained(
+                pretrained, max_pixels=MAX_PIXELS, min_pixels=MIN_PIXELS,
+                padding_side="left", trust_remote_code=True,
+            )
+        except Exception as e:
+            if os.environ.get("PROCESSOR_PATH") is None:
+                raise RuntimeError(
+                    f"Could not load the processor from '{pretrained}'. Intermediate checkpoints "
+                    f"don't save preprocessor_config.json/processor_config.json. Set "
+                    f"PROCESSOR_PATH to a dir that has them (base Qwen3.5-4B or a full/final checkpoint)."
+                ) from e
+            self.processor = AutoProcessor.from_pretrained(
+                proc_src, max_pixels=MAX_PIXELS, min_pixels=MIN_PIXELS,
+                padding_side="left", trust_remote_code=True,
+            )
         self.device = device
         self.model_device = self.model.device
 
