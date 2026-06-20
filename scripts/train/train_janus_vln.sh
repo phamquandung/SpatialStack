@@ -113,7 +113,7 @@ STOP_LOSS_WEIGHT="${STOP_LOSS_WEIGHT:-3.0}"            # up-weight STOP tokens i
 REPORT_TO="${REPORT_TO:-none}"
 
 DATALOADER_NUM_WORKERS="${DATALOADER_NUM_WORKERS:-8}"
-VLN_DEBUG="${VLN_DEBUG:-true}"
+VLN_DEBUG="${VLN_DEBUG:-false}"   # opt-in: set VLN_DEBUG=true only for smoke (forces num_workers=0 + saves frames -> slow)
 VLN_DEBUG_DEPTH="${VLN_DEBUG_DEPTH:-true}"
 if [[ "$VLN_DEBUG" == "1" || "${VLN_DEBUG,,}" == "true" ]]; then
     DATALOADER_NUM_WORKERS=0
@@ -150,8 +150,8 @@ train_args=(
     --lr_scheduler_type cosine
     --weight_decay 0.01
     --logging_steps 10
-    --save_steps 1000
-    --save_total_limit 5
+    --save_steps "${SAVE_STEPS:-1000}"
+    --save_total_limit "${SAVE_TOTAL_LIMIT:-5}"
     --deepspeed scripts/zero2_opt.json
     --gradient_checkpointing
     --dataloader_num_workers "$DATALOADER_NUM_WORKERS"
