@@ -2,9 +2,9 @@
 #SBATCH --job-name=spatialstack-janus-vln
 #SBATCH --output=logs/spatialstack_janus_vln_%j.log
 #SBATCH --error=logs/spatialstack_janus_vln_%j.err
-#SBATCH --nodelist=worker-0
-#SBATCH --gpus=8
-#SBATCH --cpus-per-task=120
+#SBATCH --nodelist=worker-2
+#SBATCH --gpus=4
+#SBATCH --cpus-per-task=60
 #SBATCH --mem-per-cpu=8192
 #
 #SBATCH --container-image=/mnt/data/vmo-ai-task/dungpq6/ubuntu22-cuda128-conda-janusvln-spatialstack.sqsh
