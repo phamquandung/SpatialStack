@@ -340,10 +340,23 @@ def train(attn_implementation="flash_attention_2"):
         **data_module,
     )
 
-    if list(pathlib.Path(training_args.output_dir).glob("checkpoint-*")):
-        logging.info("checkpoint found, resume training")
+    # RESUME=0/false -> never resume (train fresh even if checkpoints exist).
+    # RESUME=1/true  -> force resume. Default "auto" = resume iff a checkpoint exists.
+    # Avoids ZeRO world-size mismatch when reusing a dir from a different GPU count.
+    _resume = os.environ.get("RESUME", "auto").lower()
+    _has_ckpt = bool(list(pathlib.Path(training_args.output_dir).glob("checkpoint-*")))
+    if _resume in ("0", "false", "no"):
+        _do_resume = False
+    elif _resume in ("1", "true", "yes"):
+        _do_resume = True
+    else:
+        _do_resume = _has_ckpt
+    if _do_resume:
+        logging.info("Resuming from checkpoint in %s", training_args.output_dir)
         trainer.train(resume_from_checkpoint=True)
     else:
+        if _has_ckpt:
+            logging.warning("checkpoint(s) present in output_dir but RESUME=%s -> training FRESH", _resume)
         trainer.train()
     trainer.save_state()
     if getattr(data_args, "processor", None) is not None:
