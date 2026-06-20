@@ -42,8 +42,11 @@ export NCCL_DEBUG="${NCCL_DEBUG:-WARN}"
 MASTER_ADDR=${MASTER_ADDR:-127.0.0.1}
 MASTER_PORT=${MASTER_PORT:-22223}
 
-if [ -n "${SLURM_JOB_NODELIST:-}" ]; then
+if [[ -n "${SLURM_JOB_NODELIST:-}" ]] && command -v scontrol >/dev/null 2>&1; then
     MASTER_ADDR=$(scontrol show hostnames "$SLURM_JOB_NODELIST" | head -n1)
+elif [[ -n "${SLURM_JOB_NODELIST:-}" ]]; then
+    echo ">>>>> WARNING: SLURM_JOB_NODELIST is set but scontrol is not in PATH."
+    echo ">>>>> Using MASTER_ADDR=${MASTER_ADDR} (set MASTER_ADDR in the Slurm script for multi-node)"
 fi
 
 NODE_RANK=${NODE_RANK:-${SLURM_PROCID:-0}}
@@ -108,8 +111,8 @@ REFERENCE_FRAME="${REFERENCE_FRAME:-first}"
 REPORT_TO="${REPORT_TO:-none}"
 
 DATALOADER_NUM_WORKERS="${DATALOADER_NUM_WORKERS:-8}"
-VLN_DEBUG="${VLN_DEBUG:-}"
-VLN_DEBUG_DEPTH="${VLN_DEBUG_DEPTH:-}"
+VLN_DEBUG="${VLN_DEBUG:-true}"
+VLN_DEBUG_DEPTH="${VLN_DEBUG_DEPTH:-true}"
 if [[ "$VLN_DEBUG" == "1" || "${VLN_DEBUG,,}" == "true" ]]; then
     DATALOADER_NUM_WORKERS=0
     echo ">>>>> VLN_DEBUG=1: logging shapes + saving frames to ${OUTPUT_DIR}/debug_vln"

@@ -258,6 +258,16 @@ class MultiLayerFeatureFusionModule(nn.Module):
         self.lang_hidden_size = config.lang_hidden_size
         self.geometry_fusion_layers = config.geometry_fusion_layers
 
+        # Scale applied to the geometry delta before it is added to the vision
+        # tokens (JanusVLN-style `lam`). 1.0 = unchanged. Env override lets you
+        # sweep it on a trained checkpoint without retraining:
+        #   GEOMETRY_FUSION_SCALE=0.2 bash scripts/evaluation/eval_janus_vln*.sh
+        import os as _os
+        _env_scale = _os.environ.get("GEOMETRY_FUSION_SCALE")
+        self.fusion_scale = float(_env_scale) if _env_scale is not None else float(getattr(config, "fusion_scale", 1.0))
+        if self.fusion_scale != 1.0:
+            print(f"[FeatureFusion] geometry fusion delta scaled by {self.fusion_scale}")
+
         # Allow multiple fusion blocks per decoder layer (support duplicate layer indices)
         self.fusion_layers = nn.ModuleDict()
         for layer_num in self.geometry_fusion_layers:
@@ -422,7 +432,7 @@ class MultiLayerFeatureFusionModule(nn.Module):
                 assert features_2d.shape == geo_feats.shape, (
                     f"Shape mismatch: features_2d={features_2d.shape}, features_3d={geo_feats.shape}"
                 )
-                features_2d = features_2d + geo_feats
+                features_2d = features_2d + self.fusion_scale * geo_feats
 
             # cross attention
             elif self.config.fusion_method == "deepstack_vision_cross_attn":
@@ -435,7 +445,7 @@ class MultiLayerFeatureFusionModule(nn.Module):
                 geo_feats = fusion_layer['geo_ln'](features_3d_list[geo_idx])
                 geo_feats = geo_feats.reshape(-1, self.config.geo_hidden_size * self.config.spatial_merge_size ** 2)
                 geo_feats = fusion_layer['geo_mlp'](geo_feats)
-                features_2d = features_2d + geo_feats
+                features_2d = features_2d + self.fusion_scale * geo_feats
 
             elif self.config.fusion_method == "deepstack_language_cross_attn":
                 geo_feats = features_3d_list[geo_idx]

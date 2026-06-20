@@ -405,10 +405,7 @@ class Qwen3_5TextModelWithGeometry(Qwen3_5TextModel):
                 vision_token_mask = image_mask[..., 0]
                 vision_tokens = hidden_states[vision_token_mask]
                 geo_feats = geometry_layer_features[layer_idx]
-                merge_size = getattr(
-                    fusion_module.config, "spatial_merge_size",
-                    getattr(self.config.vision_config, "spatial_merge_size", 2),
-                )
+                merge_size = getattr(fusion_module.config, "spatial_merge_size", 2)
                 geo_feats = self._tile_geometry_features_for_vision_tokens(
                     geo_feats,
                     vision_tokens.shape[0],
@@ -864,6 +861,16 @@ class Qwen3_5ForConditionalGenerationWithGeometry(Qwen3_5ForConditionalGeneratio
             resolved_checkpoint_root = _resolve_qwen3_5_checkpoint_root(pretrained_model_name_or_path)
             _load_qwen3_5_geometry_submodules(model, resolved_checkpoint_root)
         return align_qwen3_5_geometry_modules(model)
+
+    def reset_vln_geometry_cache(self) -> None:
+        encoder = getattr(self.model, "geometry_encoder", None)
+        if encoder is not None and hasattr(encoder, "reset_streaming_cache"):
+            encoder.reset_streaming_cache()
+
+    def enable_vln_eval_streaming(self) -> None:
+        encoder = getattr(self.model, "geometry_encoder", None)
+        if encoder is not None and hasattr(encoder, "set_eval_streaming"):
+            encoder.set_eval_streaming(True)
 
     def forward(
         self,
