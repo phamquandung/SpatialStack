@@ -226,6 +226,7 @@ def train(attn_implementation="flash_attention_2"):
                 "pos_encoding_type",
                 "vision_language_fusion_layers",
                 "geometry_encoder_streaming",
+                "geometry_fusion_scale",
             ]:
                 setattr(config, k, getattr(model_args, k))
 
@@ -280,6 +281,12 @@ def train(attn_implementation="flash_attention_2"):
         use_fast=False,
     )
     set_model(model_args, model)
+
+    # STOP-action up-weighting for the LM loss (exposure-bias fix). No-op at 1.0.
+    if getattr(model_args, "stop_loss_weight", 1.0) != 1.0 and hasattr(model, "_stop_weighted_loss"):
+        model.stop_loss_weight = float(model_args.stop_loss_weight)
+        model.stop_token_ids = list(set(tokenizer("STOP", add_special_tokens=False).input_ids))
+        print(f">>>>> STOP loss up-weight: {model.stop_loss_weight} on token ids {model.stop_token_ids}")
 
     import torch.distributed as dist
 

@@ -108,6 +108,8 @@ FEATURE_FUSION_METHOD="${FEATURE_FUSION_METHOD:-deepstack_language_add}"
 GEOMETRY_FUSION_LAYERS="${GEOMETRY_FUSION_LAYERS:-0 1 2}"
 GEOMETRY_ENCODER_LAYERS="${GEOMETRY_ENCODER_LAYERS:-11 17 23}"
 REFERENCE_FRAME="${REFERENCE_FRAME:-first}"
+GEOMETRY_FUSION_SCALE="${GEOMETRY_FUSION_SCALE:-1.0}"   # JanusVLN-style lam on geometry delta (saved to config)
+STOP_LOSS_WEIGHT="${STOP_LOSS_WEIGHT:-1.0}"            # up-weight STOP tokens in LM loss (exposure-bias fix)
 REPORT_TO="${REPORT_TO:-none}"
 
 DATALOADER_NUM_WORKERS="${DATALOADER_NUM_WORKERS:-8}"
@@ -167,6 +169,8 @@ if [[ "${USE_GEOMETRY_ENCODER,,}" == "true" ]]; then
         --feature_fusion_method "$FEATURE_FUSION_METHOD"
         --geometry_fusion_layers ${GEOMETRY_FUSION_LAYERS}
         --geometry_encoder_layers ${GEOMETRY_ENCODER_LAYERS}
+        --geometry_fusion_scale "$GEOMETRY_FUSION_SCALE"
+        --stop_loss_weight "$STOP_LOSS_WEIGHT"
     )
 fi
 

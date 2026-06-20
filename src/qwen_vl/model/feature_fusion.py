@@ -28,6 +28,7 @@ class MultiLayerFeatureFusionConfig:
     num_heads: int = 8
     dropout: float = 0.1
     include_camera_token: bool = False
+    fusion_scale: float = 1.0  # JanusVLN-style lam on the geometry delta (env GEOMETRY_FUSION_SCALE overrides)
 
 class CrossAttentionBlock(nn.Module):
     """Single cross-attention block with position encoding, MLP and residual connections."""

@@ -532,6 +532,7 @@ class Qwen3_5ModelWithGeometry(Qwen3_5Model):
                 spatial_merge_size=config.vision_config.spatial_merge_size,
                 num_heads=getattr(config, "fusion_attention_heads", 8),
                 dropout=getattr(config, "fusion_dropout", 0.1),
+                fusion_scale=getattr(config, "geometry_fusion_scale", 1.0),
             )
             self.language_feature_fusion = MultiLayerFeatureFusionModule(fusion_config)
             self.language_feature_fusion.apply(self._init_weights)
@@ -645,13 +646,43 @@ class Qwen3_5ModelWithGeometry(Qwen3_5Model):
             raise ValueError("Qwen3.5 geometry fusion requires both geometry_fusion_layers and geometry_encoder_layers.")
         assert len(geometry_encoder_inputs) == 1, "Qwen3.5 geometry fusion currently expects per-device batch size 1."
         use_streaming = getattr(self.config, "geometry_encoder_streaming", False)
-        layer_features = self.geometry_encoder.encode_layers_with_mode(
-            geometry_encoder_inputs[0],
-            layer_indices=geometry_encoder_layers,
-            spatial_merge_size=spatial_merge_size,
-            include_camera_token=include_camera_token,
-            streaming=use_streaming,
-        )
+
+        # Optional disk cache of the frozen VGGT layer features. VGGT is frozen, so
+        # these outputs are a deterministic function of the input frames + encoder
+        # layers + reference frame. Caching gives NO speedup within a single 1-epoch
+        # run (each sample is seen once), but is reused across re-runs / recipe sweeps
+        # that change only DOWNSTREAM settings (fusion layers, stop weight, lr...).
+        # Enable with env GEOMETRY_FEATURE_CACHE_DIR=/path/to/cache.
+        cache_dir = os.environ.get("GEOMETRY_FEATURE_CACHE_DIR")
+        cache_path = None
+        if cache_dir:
+            import hashlib
+            inp = geometry_encoder_inputs[0]
+            h = hashlib.blake2b(digest_size=16)
+            h.update(inp.detach().to(torch.float16).cpu().contiguous().numpy().tobytes())
+            meta = f"{list(geometry_encoder_layers)}|{spatial_merge_size}|{include_camera_token}|{use_streaming}|{getattr(self.config,'reference_frame','first')}"
+            h.update(meta.encode())
+            os.makedirs(cache_dir, exist_ok=True)
+            cache_path = os.path.join(cache_dir, h.hexdigest() + ".pt")
+            if os.path.exists(cache_path):
+                _dtype = torch.bfloat16 if (torch.cuda.is_available() and torch.cuda.get_device_capability()[0] >= 8) else torch.float16
+                cached = torch.load(cache_path, map_location=inp.device)
+                layer_features = [t.to(device=inp.device, dtype=_dtype) for t in cached]
+            else:
+                layer_features = None
+        else:
+            layer_features = None
+
+        if layer_features is None:
+            layer_features = self.geometry_encoder.encode_layers_with_mode(
+                geometry_encoder_inputs[0],
+                layer_indices=geometry_encoder_layers,
+                spatial_merge_size=spatial_merge_size,
+                include_camera_token=include_camera_token,
+                streaming=use_streaming,
+            )
+            if cache_path is not None:
+                torch.save([t.detach().to(torch.float16).cpu() for t in layer_features], cache_path)
 
         geometry_layer_features: Dict[int, List[torch.Tensor]] = {}
         for layer_idx, layer_feature in zip(fusion_layers, layer_features):
@@ -872,6 +903,23 @@ class Qwen3_5ForConditionalGenerationWithGeometry(Qwen3_5ForConditionalGeneratio
         if encoder is not None and hasattr(encoder, "set_eval_streaming"):
             encoder.set_eval_streaming(True)
 
+    @staticmethod
+    def _stop_weighted_loss(logits, labels, stop_token_ids, stop_weight):
+        """Causal-LM cross-entropy that up-weights tokens belonging to the STOP
+        action label. Reduces to the standard mean-over-valid-tokens loss when
+        stop_weight == 1.0, so the baseline scale is unchanged."""
+        import torch.nn.functional as F
+
+        vocab = logits.shape[-1]
+        shift_logits = logits[..., :-1, :].contiguous().view(-1, vocab).float()
+        shift_labels = labels[..., 1:].contiguous().view(-1).to(shift_logits.device)
+        ce = F.cross_entropy(shift_logits, shift_labels, reduction="none", ignore_index=-100)
+        valid = (shift_labels != -100).float()
+        stop_tensor = torch.as_tensor(list(stop_token_ids), device=shift_labels.device)
+        is_stop = torch.isin(shift_labels, stop_tensor).float()
+        weights = (1.0 + (stop_weight - 1.0) * is_stop) * valid
+        return (ce * weights).sum() / weights.sum().clamp(min=1.0)
+
     def forward(
         self,
         input_ids: torch.LongTensor = None,
@@ -913,7 +961,12 @@ class Qwen3_5ForConditionalGenerationWithGeometry(Qwen3_5ForConditionalGeneratio
 
         loss = None
         if labels is not None:
-            loss = self.loss_function(logits=logits, labels=labels, vocab_size=self.config.text_config.vocab_size)
+            stop_w = float(getattr(self, "stop_loss_weight", 1.0))
+            stop_ids = getattr(self, "stop_token_ids", None)
+            if stop_w != 1.0 and stop_ids:
+                loss = self._stop_weighted_loss(logits, labels, stop_ids, stop_w)
+            else:
+                loss = self.loss_function(logits=logits, labels=labels, vocab_size=self.config.text_config.vocab_size)
 
         return Qwen3_5CausalLMOutputWithPast(
             loss=loss,

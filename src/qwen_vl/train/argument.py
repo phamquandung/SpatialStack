@@ -24,6 +24,8 @@ class ModelArguments:
     pos_encoding_type: str = field(default="none")  # Position encoding: "none", "rope2d", or "sincos2d"
     vision_language_fusion_layers: Optional[List[int]] = field(default=None)  # Vision block indices to fuse into decoder
     geometry_encoder_streaming: bool = field(default=False)  # JanusVLN-style frame-by-frame VGGT KV cache
+    geometry_fusion_scale: float = field(default=1.0)  # JanusVLN-style lam on the geometry delta (saved to config)
+    stop_loss_weight: float = field(default=1.0)  # Up-weight STOP-action tokens in the LM loss (exposure-bias fix)
 
 @dataclass
 class DataArguments:
