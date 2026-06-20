@@ -146,6 +146,7 @@ train_args=(
     --video_min_frame_pixels $((256*28*28))
     --num_train_epochs 1
     --warmup_ratio 0.03
+    ${MAX_TRAIN_STEPS:+--max_steps $MAX_TRAIN_STEPS}
     --lr_scheduler_type cosine
     --weight_decay 0.01
     --logging_steps 10
