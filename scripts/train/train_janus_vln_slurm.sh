@@ -56,7 +56,7 @@ export CACHE_DIR="${CACHE_DIR:-${PROJECT_ROOT}/cache}"
 export GEOMETRY_FUSION_LAYERS="${GEOMETRY_FUSION_LAYERS:-3 7 11}"        # fuse into full-attention decoder layers (not [0,1,2])
 export GEOMETRY_ENCODER_LAYERS="${GEOMETRY_ENCODER_LAYERS:-11 17 23}"   # VGGT aggregator layers to extract (not [3,7,11])
 export GEOMETRY_FUSION_SCALE="${GEOMETRY_FUSION_SCALE:-0.5}"            # JanusVLN-style lam on the geometry delta
-export STOP_LOSS_WEIGHT="${STOP_LOSS_WEIGHT:-8}"                        # up-weight rare STOP (1.26% of action labels)
+export STOP_LOSS_WEIGHT="${STOP_LOSS_WEIGHT:-1}"                        # 1 = none (JanusVLN handles the 1.26% STOP imbalance unweighted); raise only if STOP still under-fires
 
 # --- Weights & Biases (offline; sync later with `wandb sync`) ---
 export REPORT_TO="${REPORT_TO:-wandb}"
