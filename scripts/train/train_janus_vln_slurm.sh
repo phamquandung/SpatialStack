@@ -47,8 +47,16 @@ export GEOMETRY_ENCODER_PATH="${GEOMETRY_ENCODER_PATH:-/mnt/data/vmo-ai-task/dun
 export DATASETS="${DATASETS:-train_r2r_rxr%100}"
 export TOTAL_BATCH_SIZE="${TOTAL_BATCH_SIZE:-64}"
 export LR="${LR:-2e-5}"
-export OUTPUT_DIR="${OUTPUT_DIR:-/mnt/data/vmo-ai-task/dungpq6/model-checkpoint/spatialstack_janus_vln_train}"
+export OUTPUT_DIR="${OUTPUT_DIR:-/mnt/data/vmo-ai-task/dungpq6/model-checkpoint/vln_fix}"   # fresh dir per recipe (avoid resuming the old run)
 export CACHE_DIR="${CACHE_DIR:-${PROJECT_ROOT}/cache}"
+
+# --- Geometry fusion recipe (STOP-collapse fix) ---
+# Override train_janus_vln.sh's defaults so a slurm run trains the validated recipe,
+# not the broken one (fusion in early linear-attention layers / shallow VGGT layers).
+export GEOMETRY_FUSION_LAYERS="${GEOMETRY_FUSION_LAYERS:-3 7 11}"        # fuse into full-attention decoder layers (not [0,1,2])
+export GEOMETRY_ENCODER_LAYERS="${GEOMETRY_ENCODER_LAYERS:-11 17 23}"   # VGGT aggregator layers to extract (not [3,7,11])
+export GEOMETRY_FUSION_SCALE="${GEOMETRY_FUSION_SCALE:-0.5}"            # JanusVLN-style lam on the geometry delta
+export STOP_LOSS_WEIGHT="${STOP_LOSS_WEIGHT:-8}"                        # up-weight rare STOP (1.26% of action labels)
 
 # --- Weights & Biases (offline; sync later with `wandb sync`) ---
 export REPORT_TO="${REPORT_TO:-wandb}"
@@ -76,6 +84,8 @@ echo "GEOMETRY_ENCODER_PATH=${GEOMETRY_ENCODER_PATH}"
 echo "OUTPUT_DIR=${OUTPUT_DIR}"
 echo "TOTAL_BATCH_SIZE=${TOTAL_BATCH_SIZE}"
 echo "DATASETS=${DATASETS}"
+echo "GEOMETRY_FUSION_LAYERS=${GEOMETRY_FUSION_LAYERS}  GEOMETRY_ENCODER_LAYERS=${GEOMETRY_ENCODER_LAYERS}"
+echo "GEOMETRY_FUSION_SCALE=${GEOMETRY_FUSION_SCALE}  STOP_LOSS_WEIGHT=${STOP_LOSS_WEIGHT}"
 echo "REPORT_TO=${REPORT_TO}"
 echo "WANDB_MODE=${WANDB_MODE}"
 echo "WANDB_PROJECT=${WANDB_PROJECT}"
