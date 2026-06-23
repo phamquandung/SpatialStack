@@ -228,6 +228,14 @@ class LazySupervisedDataset(Dataset):
                 annotations = read_jsonl(data["annotation_path"], max_samples=data_args.max_samples)
             else:
                 annotations = json.load(open(data["annotation_path"], "r"))
+            # R2R-only test runs: drop RxR samples (identified by image path) without rebuilding the JSON.
+            if os.environ.get("VLN_R2R_ONLY", "").lower() in ("1", "true", "yes"):
+                before = len(annotations)
+                annotations = [
+                    ann for ann in annotations
+                    if not any("/RxR/" in img for img in ann.get("images", []))
+                ]
+                rank0_print(f"VLN_R2R_ONLY: kept {len(annotations)}/{before} samples (dropped RxR)")
             if data_args.max_samples is not None and data_args.max_samples > 0:
                 annotations = annotations[: data_args.max_samples]
             sampling_rate = data.get("sampling_rate", 1.0)

@@ -33,6 +33,23 @@ sys.path.insert(0, str(REPO_ROOT / "src"))
 import evaluation as ev  # noqa: E402
 
 
+def _gram_norm(Z: torch.Tensor) -> torch.Tensor:
+    """Centered linear gram matrix [n,n], Frobenius-normalized (for fast CKA)."""
+    Zc = (Z - Z.mean(0, keepdim=True)).float()
+    K = Zc @ Zc.t()
+    return K / (torch.linalg.norm(K) + 1e-8)
+
+
+def _geo_rep_torch(feat: torch.Tensor, n_vis: int):
+    """VGGT layer feature [n_image, n_tok, C] -> [n_vis, 4C] at vision-token granularity (2x2 merge)."""
+    g = feat.float()
+    n_image, n_tok, C = g.shape
+    if n_tok % 4 != 0:
+        return None
+    gm = g.reshape(n_image, n_tok // 4, 4 * C).reshape(-1, 4 * C)
+    return gm if gm.shape[0] == n_vis else None
+
+
 def linear_cka(X: np.ndarray, Y: np.ndarray) -> float:
     """Linear CKA between [n,d1] and [n,d2]; handles different feature dims."""
     X = X - X.mean(0, keepdims=True)
@@ -52,6 +69,7 @@ def main():
     ap.add_argument("--frames_dir", default="debug_vln_output_100/frames")
     ap.add_argument("--instruction", default="Walk forward, then stop at the doorway.")
     ap.add_argument("--out_dir", default="debug_vln_output_100/fusion_layers")
+    ap.add_argument("--max_frames", type=int, default=5, help="cap frames to bound backward memory (keeps the most recent)")
     ap.add_argument("--processor_path", default=None,
                     help="dir with a full processor (preprocessor_config.json); defaults to PROCESSOR_PATH env or model_path. "
                          "Intermediate checkpoints lack it — point at base Qwen3.5-4B.")
@@ -86,6 +104,8 @@ def main():
     if not fps:
         raise SystemExit(f"no frames in {args.frames_dir}")
     frames = [Image.open(p).convert("RGB") for p in fps]
+    if args.max_frames and len(frames) > args.max_frames:
+        frames = frames[-args.max_frames:]   # keep the most recent (current view is last)
     try:
         proc = AutoProcessor.from_pretrained(proc_src, max_pixels=ev.MAX_PIXELS,
                                              min_pixels=ev.MIN_PIXELS, trust_remote_code=True)
@@ -138,8 +158,15 @@ def main():
                 image_grid_thw=mi["image_grid_thw"].to(dev),
                 geometry_encoder_inputs=[geo_stack])
     decision_logit = out.logits[0, -1].float().max()   # the model's chosen next-token logit
-    model.zero_grad(set_to_none=True)
-    decision_logit.backward()
+    have_grad = True
+    try:
+        model.zero_grad(set_to_none=True)
+        decision_logit.backward()
+    except torch.cuda.OutOfMemoryError:
+        have_grad = False
+        torch.cuda.empty_cache()
+        print("[attribution] backward OOM -> skipping attribution panel (CKA matrix still computed). "
+              "Retry with smaller --max_frames (e.g. 3) for the attribution panel.")
     for h in handles:
         h.remove()
 
@@ -148,9 +175,12 @@ def main():
     txt_mask = ~vis_mask
     for i in range(n_layers):
         H = captured[i][0]                       # [T, hid]
-        g = captured[i].grad[0]                  # [T, hid]
-        vis_attr.append(g[vis_mask].float().norm(dim=-1).mean().item())
-        txt_attr.append(g[txt_mask].float().norm(dim=-1).mean().item())
+        if have_grad and captured[i].grad is not None:
+            g = captured[i].grad[0]              # [T, hid]
+            vis_attr.append(g[vis_mask].float().norm(dim=-1).mean().item())
+            txt_attr.append(g[txt_mask].float().norm(dim=-1).mean().item())
+        else:
+            vis_attr.append(float("nan")); txt_attr.append(float("nan"))
         if geo_rep is not None:
             Hv = H[vis_mask].detach().float().cpu().numpy()
             cka.append(linear_cka(geo_rep, Hv))
@@ -192,6 +222,76 @@ def main():
     p = out_dir / "fusion_layer_profile.png"
     fig.savefig(p, dpi=130)
     print(f"[plot] wrote {p}")
+
+    # ============================================================
+    # VGGT-layer x LLM-layer CKA matrix (both axes + the pairing)
+    # ============================================================
+    try:
+        torch.cuda.empty_cache()
+      # everything below is forward-only / detached -> no autograd graph, low memory
+        agg_depth = int(getattr(model.model.geometry_encoder.vggt.aggregator, "depth", 24))
+        vggt_layers = list(range(agg_depth))
+        # subsample vision tokens to keep the gram matrices cheap
+        cap = min(n_vis, 2000)
+        sel = torch.randperm(n_vis, device=dev)[:cap]
+        # LLM grams (one per layer), on the same vision tokens
+        Ll = []
+        for i in range(n_layers):
+            Hv = captured[i][0][vis_mask][sel].detach()
+            Ll.append(_gram_norm(Hv))
+        # VGGT grams (one per aggregator layer)
+        feats_all = model.model.geometry_encoder.encode_layers_with_mode(
+            geo_stack, layer_indices=vggt_layers, spatial_merge_size=2, streaming=False)
+        Kv, valid_v = [], []
+        for f in feats_all:
+            gr = _geo_rep_torch(f, n_vis)
+            if gr is None:
+                Kv.append(None)
+            else:
+                Kv.append(_gram_norm(gr[sel])); valid_v.append(True)
+        M = np.full((len(vggt_layers), n_layers), np.nan)
+        for vi, K in enumerate(Kv):
+            if K is None:
+                continue
+            for li in range(n_layers):
+                M[vi, li] = float((K * Ll[li]).sum().item())
+
+        import matplotlib.pyplot as plt
+        fig2, axh = plt.subplots(figsize=(16, 9))
+        im = axh.imshow(M, aspect="auto", origin="lower", cmap="viridis")
+        axh.set_xlabel("LLM decoder layer  (where to FUSE)")
+        axh.set_ylabel("VGGT aggregator layer  (which geometry to EXTRACT)")
+        axh.set_title("Geometry-language alignment (CKA): VGGT layer x LLM layer\n"
+                      "bright = aligned -> a good (VGGT_i -> LLM_j) fusion pair.  "
+                      "red = current fuse layers, white = current VGGT layers", fontsize=10)
+        for c in cur_fuse:
+            axh.axvline(c, color="red", lw=1.0, alpha=0.7)
+        for r in (getattr(cfg, "geometry_encoder_layers", []) or []):
+            axh.axhline(r, color="white", lw=1.0, alpha=0.7)
+        # underline full-attention LLM columns on the x-axis
+        axh.set_xticks(x)
+        axh.set_xticklabels([f"{i}▼" if t == "full_attention" else str(i)
+                             for i, t in enumerate(layer_types)], fontsize=6)
+        fig2.colorbar(im, label="CKA")
+        fig2.tight_layout()
+        p2 = out_dir / "fusion_vggt_llm_cka.png"
+        fig2.savefig(p2, dpi=130)
+        print(f"[plot] wrote {p2}  (▼ = full-attention LLM layer)")
+
+        # best (VGGT -> full-attention LLM) pairs
+        print("\n=== top (VGGT_layer -> LLM full-attn layer) pairs by CKA ===")
+        pairs = []
+        for vi in range(len(vggt_layers)):
+            for li in full_idx:
+                if M[vi, li] == M[vi, li]:
+                    pairs.append((M[vi, li], vi, li))
+        pairs.sort(reverse=True)
+        for sc, vi, li in pairs[:10]:
+            print(f"  VGGT {vi:>2} -> LLM {li:>2}   CKA={sc:.3f}")
+        cur_enc = list(getattr(cfg, "geometry_encoder_layers", []) or [])
+        print(f"\nCurrent pairing: VGGT {cur_enc} -> LLM {cur_fuse}")
+    except Exception as e:
+        print(f"[matrix] skipped ({e})")
 
     # ---- text ranking: best full-attention fusion targets ----
     print("\n=== full-attention layers ranked by vision attribution (x CKA) ===")
