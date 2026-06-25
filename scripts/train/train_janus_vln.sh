@@ -102,11 +102,6 @@ echo ">>>>> VLN data root:    $VLN_DATA_ROOT"
 echo ">>>>> grad accum = $GRADIENT_ACCUMULATION_STEPS  (world_size=$WORLD_SIZE)"
 
 DATASETS="${DATASETS:-train_r2r_rxr%100}"
-# R2R-only test run: drop RxR samples from the combined JSON at load time (no JSON rebuild).
-export VLN_R2R_ONLY="${VLN_R2R_ONLY:-true}"
-if [[ "$VLN_R2R_ONLY" == "1" || "${VLN_R2R_ONLY,,}" == "true" ]]; then
-    echo ">>>>> VLN_R2R_ONLY=1: training on R2R only (RxR samples dropped at load time)"
-fi
 USE_GEOMETRY_ENCODER="${USE_GEOMETRY_ENCODER:-true}"
 GEOMETRY_ENCODER_STREAMING="${GEOMETRY_ENCODER_STREAMING:-true}"
 FEATURE_FUSION_METHOD="${FEATURE_FUSION_METHOD:-deepstack_language_add}"

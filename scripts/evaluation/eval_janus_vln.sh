@@ -16,7 +16,7 @@ if [ "${NPROC_PER_NODE}" -lt 1 ]; then
   NPROC_PER_NODE=1
 fi
 
-CHECKPOINT="${CHECKPOINT:-/mnt/samsung/Project/CoRL-ICRA/SpatialStack/model-checkpoint/spatialstack_vln_fix_0.5}"
+CHECKPOINT="${CHECKPOINT:-/mnt/samsung/Project/CoRL-ICRA/SpatialStack/model-checkpoint/spatialstack_fix}"
 GEOMETRY_ENCODER_PATH="${GEOMETRY_ENCODER_PATH:-/mnt/samsung/Project/CoRL-ICRA/SpatialStack/model-checkpoint/VGGT-1B}"
 OUTPUT_PATH="${OUTPUT_PATH:-evaluation/spatialstack_vln}"
 CONFIG="${CONFIG:-config/vln_r2r.yaml}"
