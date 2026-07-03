@@ -22,6 +22,12 @@ OUTPUT_PATH="${OUTPUT_PATH:-evaluation/spatialstack_vln}"
 CONFIG="${CONFIG:-config/vln_r2r.yaml}"
 EVAL_SPLIT="${EVAL_SPLIT:-val_unseen}"
 SAVE_VIDEO="${SAVE_VIDEO:-0}"
+# VGGT streaming KV-cache window (frames of geometry history kept during eval).
+export VGGT_KV_START="${VGGT_KV_START:-8}"
+export VGGT_KV_RECENT="${VGGT_KV_RECENT:-56}"
+# Oracle-stop diagnostic: auto-STOP within success_distance of the goal (isolates
+# navigation quality from the stop policy). Set VLN_ORACLE_STOP=1 to enable.
+export VLN_ORACLE_STOP="${VLN_ORACLE_STOP:-0}"
 export GEOMETRY_ENCODER_PATH
 
 echo "CHECKPOINT: ${CHECKPOINT}"
@@ -31,6 +37,8 @@ echo "CONFIG: ${CONFIG}"
 echo "EVAL_SPLIT: ${EVAL_SPLIT}"
 echo "NPROC_PER_NODE: ${NPROC_PER_NODE}"
 echo "SAVE_VIDEO: ${SAVE_VIDEO}"
+echo "VGGT_KV: start=${VGGT_KV_START} recent=${VGGT_KV_RECENT}"
+echo "VLN_ORACLE_STOP: ${VLN_ORACLE_STOP}"
 
 mkdir -p "${OUTPUT_PATH}"
 

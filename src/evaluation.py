@@ -397,7 +397,7 @@ class SpatialStackVLN_Inference:
                 top_p=gen_kwargs["top_p"],
                 num_beams=gen_kwargs["num_beams"],
                 max_new_tokens=gen_kwargs["max_new_tokens"],
-                use_cache=False,
+                use_cache=True,
             )
 
         generated_ids_trimmed = [
@@ -473,6 +473,30 @@ class VLNEvaluator:
             "TURN_RIGHT": [3],
         })
         self.num_history = args.num_history
+
+        # Oracle-stop diagnostic: force STOP once within success_distance of the goal.
+        # Isolates navigation quality from the (separately trained) stop policy.
+        self.oracle_stop = os.environ.get("VLN_ORACLE_STOP", "").lower() in ("1", "true", "yes")
+        try:
+            self.success_distance = float(self.config.habitat.task.measurements.success.success_distance)
+        except Exception:
+            self.success_distance = 3.0
+        if self.oracle_stop and get_rank() == 0:
+            print(f"[eval] VLN_ORACLE_STOP: auto-STOP within {self.success_distance}m of goal", flush=True)
+
+        # Teacher-forced diagnostic: roll out along the GT expert path (execute the
+        # expert action each step) and score the model's predicted action. Isolates
+        # per-step action accuracy (what CE loss measures) from rollout/exposure bias.
+        self.teacher_forced = os.environ.get("VLN_TEACHER_FORCED", "").lower() in ("1", "true", "yes")
+        self.gt_actions_map = None
+        if self.teacher_forced:
+            import gzip as _gzip
+            dp = self.config.habitat.dataset.data_path.format(split=self.split)
+            gt_path = (dp[: -len(".json.gz")] if dp.endswith(".json.gz") else dp) + "_gt.json.gz"
+            with _gzip.open(gt_path, "rt") as f:
+                self.gt_actions_map = json.load(f)
+            if get_rank() == 0:
+                print(f"[eval] VLN_TEACHER_FORCED: expert rollout scoring | gt={gt_path} ({len(self.gt_actions_map)} eps)", flush=True)
 
     def config_env(self) -> Env:
         from habitat.datasets import make_dataset
@@ -557,7 +581,20 @@ class VLNEvaluator:
                 step_times_ms = []
                 vggt_times_ms = []
 
+                gt_actions = None
+                tf_correct = tf_total = 0
+                tf_stop_total = tf_stop_correct = 0
+                if self.teacher_forced:
+                    gt_entry = self.gt_actions_map.get(str(episode_id))
+                    if gt_entry is None:
+                        print(f"[teacher_forced] no GT actions for episode {episode_id}; skipping")
+                        process_bar.update(1)
+                        continue
+                    gt_actions = gt_entry["actions"]
+
                 while not env.episode_over:
+                    if self.teacher_forced and step_id >= len(gt_actions):
+                        break
                     rgb = observations["rgb"]
                     image = Image.fromarray(rgb).convert("RGB")
                     rgb_list.append(image)
@@ -590,16 +627,32 @@ class VLNEvaluator:
                     if self.save_video and info.get("top_down_map") is not None and should_save_video:
                         vis_frames.append(observations_to_image({"rgb": observations["rgb"]}, info))
 
-                    action = self.actions2idx.get(action, [0])[0]
-                    if step_id >= self.args.max_steps:
-                        action = 0
+                    pred_action = self.actions2idx.get(action, [0])[0]
+
+                    if self.teacher_forced:
+                        gt_action = gt_actions[step_id]
+                        tf_total += 1
+                        if pred_action == gt_action:
+                            tf_correct += 1
+                        if gt_action == 0:
+                            tf_stop_total += 1
+                            if pred_action == 0:
+                                tf_stop_correct += 1
+                        action = gt_action  # follow the expert path
+                    else:
+                        action = pred_action
+                        if self.oracle_stop and info.get("distance_to_goal", float("inf")) <= self.success_distance:
+                            action = 0
+                        if step_id >= self.args.max_steps:
+                            action = 0
 
                     observations = env.step(action)
                     step_id += 1
 
-                    if len(rgb_list) > self.num_history + 1:
-                        keep = np.linspace(0, len(rgb_list) - 1, self.num_history + 1, dtype=int)
-                        rgb_list = [rgb_list[i] for i in keep]
+                    # NOTE: do NOT prune rgb_list. Keep the full trajectory so the
+                    # history subsampling above (linspace(0, current, num_history+1))
+                    # spreads across the whole path, matching training. Destructively
+                    # pruning here froze history to the first 8 frames + current.
 
                 process_bar.update(1)
                 metrics = env.get_metrics()
@@ -636,6 +689,15 @@ class VLNEvaluator:
                     "mean_vggt_ms": float(np.mean(vggt_times_ms)) if vggt_times_ms else 0.0,
                     "episode_time_s": time.perf_counter() - ep_t0,
                 }
+                if self.teacher_forced:
+                    result["tf_action_acc"] = tf_correct / tf_total if tf_total else 0.0
+                    result["tf_steps"] = tf_total
+                    result["tf_stop_recall"] = (tf_stop_correct / tf_stop_total) if tf_stop_total else -1.0
+                    print(
+                        f"[teacher_forced] {scene_id}_{episode_id} "
+                        f"action_acc={result['tf_action_acc']:.3f} ({tf_correct}/{tf_total}) "
+                        f"stop_recall={result['tf_stop_recall']:.2f}"
+                    )
                 with open(result_path, "a") as f:
                     f.write(json.dumps(result) + "\n")
 
