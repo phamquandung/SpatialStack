@@ -18,10 +18,10 @@ fi
 
 CHECKPOINT="${CHECKPOINT:-/mnt/samsung/Project/CoRL-ICRA/SpatialStack/model-checkpoint/spatialstack_vln_fix_0.5_full}"
 GEOMETRY_ENCODER_PATH="${GEOMETRY_ENCODER_PATH:-/mnt/samsung/Project/CoRL-ICRA/SpatialStack/model-checkpoint/VGGT-1B}"
-SCENE_IDS="${SCENE_IDS:-EU6Fwq7SyZv}"
+SCENE_IDS="${SCENE_IDS:-ur6pFq6Qu1A}"
 OUTPUT_PATH="${OUTPUT_PATH:-evaluation/scene/${SCENE_IDS}}"
 CONFIG="${CONFIG:-config/vln_r2r.yaml}"
-EVAL_SPLIT="${EVAL_SPLIT:-val_unseen}"
+EVAL_SPLIT="${EVAL_SPLIT:-train}"
 SAVE_VIDEO="${SAVE_VIDEO:-0}"
 export GEOMETRY_ENCODER_PATH
 

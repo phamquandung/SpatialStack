@@ -29,6 +29,11 @@ from habitat.utils.visualizations.utils import images_to_video, observations_to_
 from habitat_extensions import measures  # noqa: F401
 from utils.dist import get_rank, get_world_size, init_distributed_mode
 from qwen_vl.model.modeling_qwen3_5 import Qwen3_5ForConditionalGenerationWithGeometry
+from qwen_vl.data.utils import prepare_image_inputs
+from qwen_vl.data.data_qwen import (
+    _build_training_tokenizer,
+    _apply_training_chat_template,
+)
 
 try:
     import torch.distributed as dist
@@ -40,6 +45,21 @@ MIN_PIXELS = 256 * 28 * 28
 MAX_PIXELS = 1605632
 TRAINING_SYSTEM_PROMPT = "You are a helpful assistant."
 ACTION_NAMES = ("STOP", "MOVE_FORWARD", "TURN_LEFT", "TURN_RIGHT")
+
+# Exact training prompt (see scripts/data/create_janus_vln_data.py::VLN_PROMPT).
+# History <image> tags + one current <image> are inserted so the tokenized prompt
+# matches training byte-for-byte.
+VLN_PROMPT = (
+    "You are a visual language navigation model, and your should go to the locations "
+    "to complete the given task. Compare the observation and instruction to infer "
+    "your current progress, and then select the correct direction from the candidates "
+    "to go to the target location and finish the task.\n"
+    " This is your historical observation:{his_img_tags}\n"
+    " This is your current observation:<image>\n"
+    " Your task is to {instruction}\n"
+    " You should take one of the following actions:\n"
+    " MOVE_FORWARD\n TURN_LEFT\n TURN_RIGHT\n STOP."
+)
 
 
 def set_seed(seed: int):
@@ -265,6 +285,13 @@ class SpatialStackVLN_Inference:
         self.device = device
         self.model_device = self.model.device
 
+        # Build inputs with the SAME preprocessing as training (vggt_load + image
+        # processor with do_rescale=False, and the training chat template) so the
+        # pixel values and prompt tokens match the fine-tuning distribution exactly.
+        self.image_processor = self.processor.image_processor
+        self.merge_size = int(getattr(self.image_processor, "merge_size", 2))
+        self._train_tokenizer = _build_training_tokenizer(self.tokenizer, "qwen3.5")
+
     def reset_geometry_cache(self):
         self.model.reset_vln_geometry_cache()
 
@@ -280,42 +307,76 @@ class SpatialStackVLN_Inference:
             return 0.0
         return float(getattr(encoder, "last_vggt_ms", 0.0))
 
+    def _build_model_inputs(self, observations, task: str) -> dict:
+        """Preprocess exactly like training (prepare_image_inputs + training chat
+        template) so eval pixel values and prompt tokens match fine-tuning."""
+        pixel_values_list, grids, geo_list = [], [], []
+        for frame in observations:
+            ret = prepare_image_inputs(
+                frame,
+                self.image_processor,
+                model_type="qwen3.5",
+                geometry_encoder_streaming=self.use_geometry_streaming,
+            )
+            pixel_values_list.append(ret["pixel_values"])
+            grids.append(ret["image_grid_thw"])
+            geo_list.append(ret["geometry_encoder_inputs"])
+
+        grid_merged = [int(g.prod()) // (self.merge_size ** 2) for g in grids]
+
+        his_img_tags = "<image>" * (len(observations) - 1)
+        content = VLN_PROMPT.format(his_img_tags=his_img_tags, instruction=task)
+
+        # Expand each <image> to vision tokens using its own merged grid size,
+        # matching preprocess_qwen_2_visual in the training pipeline.
+        parts = content.split("<image>")
+        rebuilt = []
+        for idx in range(len(parts) - 1):
+            rebuilt.append(parts[idx])
+            rebuilt.append(
+                "<|vision_start|>" + "<|image_pad|>" * grid_merged[idx] + "<|vision_end|>"
+            )
+        rebuilt.append(parts[-1])
+        content = "".join(rebuilt)
+
+        input_ids = _apply_training_chat_template(
+            self._train_tokenizer,
+            [{"role": "system", "content": TRAINING_SYSTEM_PROMPT}],
+        )
+        input_ids += _apply_training_chat_template(
+            self._train_tokenizer,
+            [{"role": "user", "content": content}],
+            add_generation_prompt=True,
+        )
+        input_ids = torch.tensor([input_ids], dtype=torch.long)
+
+        model_inputs = {
+            "input_ids": input_ids,
+            "attention_mask": torch.ones_like(input_ids),
+            "pixel_values": torch.cat(pixel_values_list, dim=0),
+            "image_grid_thw": torch.stack(grids, dim=0),
+        }
+        if self.use_geometry:
+            # Streaming eval encodes only the current frame; its geometry tensor is
+            # built at the same grid resolution as in training.
+            model_inputs["geometry_encoder_inputs"] = [geo_list[-1].unsqueeze(0)]
+        return model_inputs
+
     def call_model(self, observations, task: str, step_id: int, gen_kwargs: Optional[dict] = None):
         del step_id
         gen_kwargs = gen_kwargs or {}
 
-        messages = build_training_style_vln_messages(observations, task)
-        text = self.processor.apply_chat_template(
-            messages,
-            tokenize=False,
-            add_generation_prompt=True,
-            enable_thinking=False,
-        )
-
-        current_frame = observations[-1]
-        model_inputs = self.processor(
-            text=text,
-            images=observations,
-            videos=None,
-            padding=True,
-            return_tensors="pt",
-        )
-
-        if self.use_geometry:
-            grid_thw = model_inputs["image_grid_thw"]
-            if grid_thw.ndim == 1:
-                current_grid = grid_thw.unsqueeze(0)
-            else:
-                current_grid = grid_thw[-1:]
-            geo_frame = build_qwen3_5_geometry_inputs([current_frame], current_grid)
-            model_inputs["geometry_encoder_inputs"] = [torch.stack(geo_frame)]
+        model_inputs = self._build_model_inputs(observations, task)
 
         device = self.model_device
         if self.use_geometry:
             model_inputs["geometry_encoder_inputs"] = [
                 feat.to(device) for feat in model_inputs["geometry_encoder_inputs"]
             ]
-        model_inputs = model_inputs.to(device)
+        model_inputs = {
+            k: (v.to(device) if torch.is_tensor(v) else v)
+            for k, v in model_inputs.items()
+        }
 
         if "max_new_tokens" not in gen_kwargs:
             gen_kwargs["max_new_tokens"] = 24
@@ -340,14 +401,20 @@ class SpatialStackVLN_Inference:
             )
 
         generated_ids_trimmed = [
-            out_ids[len(in_ids):] for in_ids, out_ids in zip(model_inputs.input_ids, output_ids)
+            out_ids[len(in_ids):] for in_ids, out_ids in zip(model_inputs["input_ids"], output_ids)
         ]
         answers = self.processor.batch_decode(
             generated_ids_trimmed,
             skip_special_tokens=True,
             clean_up_tokenization_spaces=False,
         )
-        return [parse_vln_action(ans) for ans in answers]
+        parsed = [parse_vln_action(ans) for ans in answers]
+        if os.environ.get("VLN_EVAL_DEBUG"):
+            print(
+                f"[EVAL_DEBUG] n_imgs={len(observations)} raw={answers!r} -> {parsed}",
+                flush=True,
+            )
+        return parsed
 
 
 class VLNEvaluator:
