@@ -227,6 +227,7 @@ def train(attn_implementation="flash_attention_2"):
                 "vision_language_fusion_layers",
                 "geometry_encoder_streaming",
                 "geometry_fusion_scale",
+                "geometry_frame_strict",
             ]:
                 setattr(config, k, getattr(model_args, k))
 

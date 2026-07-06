@@ -25,6 +25,7 @@ class ModelArguments:
     vision_language_fusion_layers: Optional[List[int]] = field(default=None)  # Vision block indices to fuse into decoder
     geometry_encoder_streaming: bool = field(default=False)  # JanusVLN-style frame-by-frame VGGT KV cache
     geometry_fusion_scale: float = field(default=1.0)  # JanusVLN-style lam on the geometry delta (saved to config)
+    geometry_frame_strict: bool = field(default=False)  # Fuse each frame with its OWN geometry (vs last-frame broadcast). Env FUSION_FRAME_STRICT overrides.
     stop_loss_weight: float = field(default=1.0)  # Up-weight STOP-action tokens in the LM loss (exposure-bias fix)
 
 @dataclass

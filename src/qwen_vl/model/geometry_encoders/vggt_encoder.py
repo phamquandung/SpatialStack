@@ -250,6 +250,7 @@ class VGGTEncoder(BaseGeometryEncoder):
         layer_indices: Optional[List[int]] = None,
         spatial_merge_size: int = 1,
         include_camera_token: bool = False,
+        frame_strict: bool = False,
     ):
         """Encode frames sequentially with VGGT KV cache (JanusVLN-style)."""
         if not self.supports_streaming():
@@ -280,6 +281,10 @@ class VGGTEncoder(BaseGeometryEncoder):
         past_key_values = [None] * self.vggt.aggregator.depth
         aggregated_tokens_list = None
         patch_start_idx = 0
+        # FUSION_FRAME_STRICT: keep every frame's geometry (each frame fused with its
+        # own vision tokens) instead of only the last frame (broadcast to all frames).
+        # per_frame_layers stays None for the non-strict path, which is unchanged.
+        per_frame_layers = {idx: [] for idx in layer_indices} if frame_strict else None
 
         with torch.no_grad():
             with torch.cuda.amp.autocast(dtype=dtype):
@@ -292,19 +297,37 @@ class VGGTEncoder(BaseGeometryEncoder):
                         past_frame_idx=frame_idx,
                     )
                     aggregated_tokens_list, patch_start_idx, past_key_values = output
+                    if frame_strict:
+                        for idx in layer_indices:
+                            per_frame_layers[idx].append(aggregated_tokens_list[idx])
 
         tensor_features = []
         for idx in layer_indices:
-            layer_output = aggregated_tokens_list[idx]
-            frame_tokens = layer_output[0, -1:, patch_start_idx:, :]
+            if frame_strict:
+                # [n_image, n_patch, dim]: concatenate each frame's own current-frame
+                # tokens (frame t already attended to <=t via the KV cache).
+                frame_tokens = torch.cat(
+                    [lo[0, -1:, patch_start_idx:, :] for lo in per_frame_layers[idx]], dim=0
+                )
+                camera_token = (
+                    torch.cat([lo[0, -1:, 0:1, :] for lo in per_frame_layers[idx]], dim=0)
+                    if include_camera_token
+                    else None
+                )
+                batch = n_image
+            else:
+                layer_output = aggregated_tokens_list[idx]
+                frame_tokens = layer_output[0, -1:, patch_start_idx:, :]  # [1, n_patch, dim]
+                camera_token = layer_output[0, -1:, 0:1, :] if include_camera_token else None
+                batch = 1
             # reference_frame flip is applied on the image sequence before the loop
 
-            patch_grid = frame_tokens.reshape(1, h_patch, w_patch, -1)
+            patch_grid = frame_tokens.reshape(batch, h_patch, w_patch, -1)
             trimmed_h = (h_patch // spatial_merge_size) * spatial_merge_size or h_patch
             trimmed_w = (w_patch // spatial_merge_size) * spatial_merge_size or w_patch
             patch_grid = patch_grid[:, :trimmed_h, :trimmed_w, :]
             patch_grid = patch_grid.reshape(
-                1,
+                batch,
                 trimmed_h // spatial_merge_size,
                 spatial_merge_size,
                 trimmed_w // spatial_merge_size,
@@ -312,10 +335,9 @@ class VGGTEncoder(BaseGeometryEncoder):
                 -1,
             )
             patch_grid = patch_grid.permute(0, 1, 3, 2, 4, 5)
-            patch_tokens = patch_grid.reshape(1, trimmed_h * trimmed_w, -1)
+            patch_tokens = patch_grid.reshape(batch, trimmed_h * trimmed_w, -1)
 
             if include_camera_token:
-                camera_token = layer_output[0, -1:, 0:1, :]
                 geo_feature = torch.cat([camera_token, patch_tokens], dim=1)
             else:
                 geo_feature = patch_tokens
@@ -435,6 +457,7 @@ class VGGTEncoder(BaseGeometryEncoder):
         spatial_merge_size: int = 1,
         include_camera_token: bool = False,
         streaming: bool = False,
+        frame_strict: bool = False,
     ):
         if streaming:
             return self.encode_layers_streaming(
@@ -442,6 +465,7 @@ class VGGTEncoder(BaseGeometryEncoder):
                 layer_indices=layer_indices,
                 spatial_merge_size=spatial_merge_size,
                 include_camera_token=include_camera_token,
+                frame_strict=frame_strict,
             )
         return self.encode_layers(
             images,

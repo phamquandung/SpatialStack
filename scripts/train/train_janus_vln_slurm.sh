@@ -2,9 +2,9 @@
 #SBATCH --job-name=spatialstack-janus-vln
 #SBATCH --output=logs/spatialstack_janus_vln_%j.log
 #SBATCH --error=logs/spatialstack_janus_vln_%j.err
-#SBATCH --nodelist=worker-2
-#SBATCH --gpus=4
-#SBATCH --cpus-per-task=60
+#SBATCH --nodelist=worker-0
+#SBATCH --gpus=8
+#SBATCH --cpus-per-task=120
 #SBATCH --mem-per-cpu=8192
 #
 #SBATCH --container-image=/mnt/data/vmo-ai-task/dungpq6/ubuntu22-cuda128-conda-janusvln-spatialstack.sqsh
@@ -53,9 +53,10 @@ export CACHE_DIR="${CACHE_DIR:-${PROJECT_ROOT}/cache}"
 # --- Geometry fusion recipe (STOP-collapse fix) ---
 # Override train_janus_vln.sh's defaults so a slurm run trains the validated recipe,
 # not the broken one (fusion in early linear-attention layers / shallow VGGT layers).
-export GEOMETRY_FUSION_LAYERS="${GEOMETRY_FUSION_LAYERS:-3 7 11}"        # fuse into full-attention decoder layers (not [0,1,2])
-export GEOMETRY_ENCODER_LAYERS="${GEOMETRY_ENCODER_LAYERS:-11 17 23}"   # VGGT aggregator layers to extract (not [3,7,11])
+export GEOMETRY_FUSION_LAYERS="${GEOMETRY_FUSION_LAYERS:-0 1 2}"        
+export GEOMETRY_ENCODER_LAYERS="${GEOMETRY_ENCODER_LAYERS:-11 17 23}"   
 export GEOMETRY_FUSION_SCALE="${GEOMETRY_FUSION_SCALE:-0.5}"            # JanusVLN-style lam on the geometry delta
+export GEOMETRY_FRAME_STRICT="${GEOMETRY_FRAME_STRICT:-true}"          # Step 1 fusion migration: per-frame geometry (default off = baseline broadcast)
 export STOP_LOSS_WEIGHT="${STOP_LOSS_WEIGHT:-1}"                        # 1 = none (JanusVLN handles the 1.26% STOP imbalance unweighted); raise only if STOP still under-fires
 
 # --- Weights & Biases (offline; sync later with `wandb sync`) ---
@@ -86,6 +87,7 @@ echo "TOTAL_BATCH_SIZE=${TOTAL_BATCH_SIZE}"
 echo "DATASETS=${DATASETS}"
 echo "GEOMETRY_FUSION_LAYERS=${GEOMETRY_FUSION_LAYERS}  GEOMETRY_ENCODER_LAYERS=${GEOMETRY_ENCODER_LAYERS}"
 echo "GEOMETRY_FUSION_SCALE=${GEOMETRY_FUSION_SCALE}  STOP_LOSS_WEIGHT=${STOP_LOSS_WEIGHT}"
+echo "GEOMETRY_FRAME_STRICT=${GEOMETRY_FRAME_STRICT}"
 echo "REPORT_TO=${REPORT_TO}"
 echo "WANDB_MODE=${WANDB_MODE}"
 echo "WANDB_PROJECT=${WANDB_PROJECT}"

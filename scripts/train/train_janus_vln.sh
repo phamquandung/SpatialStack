@@ -109,6 +109,7 @@ GEOMETRY_FUSION_LAYERS="${GEOMETRY_FUSION_LAYERS:-0 1 2}"
 GEOMETRY_ENCODER_LAYERS="${GEOMETRY_ENCODER_LAYERS:-3 7 11}"
 REFERENCE_FRAME="${REFERENCE_FRAME:-first}"
 GEOMETRY_FUSION_SCALE="${GEOMETRY_FUSION_SCALE:-0.5}"   # JanusVLN-style lam on geometry delta (saved to config)
+GEOMETRY_FRAME_STRICT="${GEOMETRY_FRAME_STRICT:-true}" # Step 1: per-frame geometry vs last-frame broadcast (default off = baseline)
 STOP_LOSS_WEIGHT="${STOP_LOSS_WEIGHT:-3.0}"            # up-weight STOP tokens in LM loss (exposure-bias fix)
 REPORT_TO="${REPORT_TO:-none}"
 
@@ -171,6 +172,7 @@ if [[ "${USE_GEOMETRY_ENCODER,,}" == "true" ]]; then
         --geometry_fusion_layers ${GEOMETRY_FUSION_LAYERS}
         --geometry_encoder_layers ${GEOMETRY_ENCODER_LAYERS}
         --geometry_fusion_scale "$GEOMETRY_FUSION_SCALE"
+        --geometry_frame_strict "$GEOMETRY_FRAME_STRICT"
         --stop_loss_weight "$STOP_LOSS_WEIGHT"
     )
 fi

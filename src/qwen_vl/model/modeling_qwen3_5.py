@@ -646,6 +646,15 @@ class Qwen3_5ModelWithGeometry(Qwen3_5Model):
             raise ValueError("Qwen3.5 geometry fusion requires both geometry_fusion_layers and geometry_encoder_layers.")
         assert len(geometry_encoder_inputs) == 1, "Qwen3.5 geometry fusion currently expects per-device batch size 1."
         use_streaming = getattr(self.config, "geometry_encoder_streaming", False)
+        # Step 1 (fusion migration): frame-strict geometry. Default False -> current
+        # last-frame broadcast. Env FUSION_FRAME_STRICT overrides config.geometry_frame_strict
+        # so it can be swept on a trained checkpoint without retraining.
+        _env_fs = os.environ.get("FUSION_FRAME_STRICT")
+        frame_strict = (
+            _env_fs.lower() in ("1", "true", "yes")
+            if _env_fs is not None
+            else bool(getattr(self.config, "geometry_frame_strict", False))
+        )
 
         # Optional disk cache of the frozen VGGT layer features. VGGT is frozen, so
         # these outputs are a deterministic function of the input frames + encoder
@@ -660,7 +669,7 @@ class Qwen3_5ModelWithGeometry(Qwen3_5Model):
             inp = geometry_encoder_inputs[0]
             h = hashlib.blake2b(digest_size=16)
             h.update(inp.detach().to(torch.float16).cpu().contiguous().numpy().tobytes())
-            meta = f"{list(geometry_encoder_layers)}|{spatial_merge_size}|{include_camera_token}|{use_streaming}|{getattr(self.config,'reference_frame','first')}"
+            meta = f"{list(geometry_encoder_layers)}|{spatial_merge_size}|{include_camera_token}|{use_streaming}|{frame_strict}|{getattr(self.config,'reference_frame','first')}"
             h.update(meta.encode())
             os.makedirs(cache_dir, exist_ok=True)
             cache_path = os.path.join(cache_dir, h.hexdigest() + ".pt")
@@ -680,6 +689,7 @@ class Qwen3_5ModelWithGeometry(Qwen3_5Model):
                 spatial_merge_size=spatial_merge_size,
                 include_camera_token=include_camera_token,
                 streaming=use_streaming,
+                frame_strict=frame_strict,
             )
             if cache_path is not None:
                 torch.save([t.detach().to(torch.float16).cpu() for t in layer_features], cache_path)
