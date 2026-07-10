@@ -29,6 +29,110 @@ class MultiLayerFeatureFusionConfig:
     dropout: float = 0.1
     include_camera_token: bool = False
     fusion_scale: float = 1.0  # JanusVLN-style lam on the geometry delta (env GEOMETRY_FUSION_SCALE overrides)
+    importance_gate: bool = False  # Step 2': per-position sigmoid gate on the geometry delta (env FUSION_IMPORTANCE_GATE overrides)
+    learnable_scale: bool = False  # Step 2'': learnable per-layer scale on the geometry delta (replaces fixed fusion_scale; env FUSION_LEARNABLE_SCALE overrides)
+    spatial_bias: bool = False  # Step 4: GeoThinker spatial-distance bias on the SGF cross-attention (env FUSION_SPATIAL_BIAS overrides)
+
+
+class LearnableScale(nn.Module):
+    """Learnable scalar multiplier on the geometry delta (Step 2'').
+
+    Replaces the fixed `fusion_scale`. Initialized to `init_value` so training
+    starts identical to the fixed-scale baseline, then the model learns a
+    per-fusion-layer geometry strength.
+    """
+
+    def __init__(self, init_value: float = 1.0):
+        super().__init__()
+        self.scale = nn.Parameter(torch.tensor(float(init_value)))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.scale * x
+
+
+class SGFCrossAttentionBlock(nn.Module):
+    """GeoThinker-style Spatial-Grounded Fusion for the language/decoder path.
+
+    Frame-strict cross-attention (Q = vision tokens, K/V = geometry tokens) with:
+      - Step 2  : the cross-attention itself (SDPA, so bias terms can be added).
+      - Step 3  : optional importance gate  -> log(importance) added to attn logits.
+      - Step 4  : optional spatial-distance bias on half the heads (gated).
+    Output is scaled by tanh(gate) with gate init 0 -> exact no-op at step 0.
+    Returns the geometry DELTA; the caller adds it to the vision tokens.
+    """
+
+    def __init__(self, hidden_size, num_heads=8, dropout=0.1,
+                 use_importance_gate=False, use_spatial_bias=False):
+        super().__init__()
+        self.hidden_size = hidden_size
+        self.num_heads = num_heads
+        self.head_dim = hidden_size // num_heads
+        self.dropout = dropout
+        self.use_importance_gate = use_importance_gate
+        self.use_spatial_bias = use_spatial_bias
+
+        self.q_norm = nn.LayerNorm(hidden_size)
+        self.kv_norm = nn.LayerNorm(hidden_size)
+        self.q_proj = nn.Linear(hidden_size, hidden_size, bias=False)
+        self.k_proj = nn.Linear(hidden_size, hidden_size, bias=False)
+        self.v_proj = nn.Linear(hidden_size, hidden_size, bias=False)
+        self.o_proj = nn.Linear(hidden_size, hidden_size, bias=False)
+        self.gate = nn.Parameter(torch.tensor(0.0))  # tanh(gate)=0 -> no-op at init
+
+        if use_importance_gate:
+            self.importance_net = nn.Sequential(
+                nn.Linear(hidden_size, hidden_size // 4),
+                nn.ReLU(),
+                nn.Linear(hidden_size // 4, 1),
+                nn.Sigmoid(),
+            )
+        if use_spatial_bias:
+            # One sigmoid gate per (half) head, conditioned on the geometry token.
+            self.bias_gate = nn.Sequential(
+                nn.Linear(hidden_size, max(1, num_heads // 2)),
+                nn.Sigmoid(),
+            )
+
+    @staticmethod
+    def _spatial_bias(h_feat, w_feat, device, dtype):
+        # -normalized pairwise euclidean distance between patch grid coords: [S, S]
+        y = torch.arange(h_feat, device=device, dtype=dtype)
+        x = torch.arange(w_feat, device=device, dtype=dtype)
+        gy, gx = torch.meshgrid(y, x, indexing="ij")
+        coords = torch.stack([gy.flatten(), gx.flatten()], dim=-1)
+        dist = torch.cdist(coords, coords, p=2)
+        diag = (float(h_feat) ** 2 + float(w_feat) ** 2) ** 0.5 + 1e-6
+        return -dist / diag
+
+    def forward(self, q_in, kv_in, grid_hw=None):
+        # q_in / kv_in: [B, S, D]  (B = frames, S = merged tokens per frame)
+        q_in = self.q_norm(q_in)
+        kv_in = self.kv_norm(kv_in)
+        B, S, D = q_in.shape
+        q = self.q_proj(q_in).view(B, S, self.num_heads, self.head_dim).transpose(1, 2)
+        k = self.k_proj(kv_in).view(B, S, self.num_heads, self.head_dim).transpose(1, 2)
+        v = self.v_proj(kv_in).view(B, S, self.num_heads, self.head_dim).transpose(1, 2)
+
+        attn_bias = None
+        if self.use_spatial_bias and grid_hw is not None:
+            h_feat, w_feat = grid_hw
+            if h_feat * w_feat == S:
+                sb = self._spatial_bias(h_feat, w_feat, q.device, q.dtype)  # [S, S]
+                gate = self.bias_gate(kv_in).transpose(1, 2).unsqueeze(-1)  # [B, H/2, S, 1]
+                bias = torch.zeros(B, self.num_heads, S, S, device=q.device, dtype=q.dtype)
+                half = max(1, self.num_heads // 2)
+                bias[:, :half] = sb * gate
+                attn_bias = bias
+        if self.use_importance_gate:
+            imp = self.importance_net(kv_in)  # [B, S, 1] from geometry (background suppression)
+            imp_logit = torch.log(imp + 0.1).view(B, 1, 1, S)  # additive key-side bias
+            attn_bias = imp_logit if attn_bias is None else attn_bias + imp_logit
+
+        out = F.scaled_dot_product_attention(q, k, v, attn_mask=attn_bias)
+        out = out.transpose(1, 2).contiguous().view(B, S, D)
+        out = self.o_proj(out)
+        return torch.tanh(self.gate) * out
+
 
 class CrossAttentionBlock(nn.Module):
     """Single cross-attention block with position encoding, MLP and residual connections."""
@@ -269,6 +373,40 @@ class MultiLayerFeatureFusionModule(nn.Module):
         if self.fusion_scale != 1.0:
             print(f"[FeatureFusion] geometry fusion delta scaled by {self.fusion_scale}")
 
+        # Step 2': per-position importance gate on the geometry delta (GeoThinker-style
+        # background suppression, applied to the ADD path). Env FUSION_IMPORTANCE_GATE
+        # overrides config.importance_gate. Must be resolved before building layers.
+        _env_ig = _os.environ.get("FUSION_IMPORTANCE_GATE")
+        self.use_importance_gate = (
+            _env_ig.lower() in ("1", "true", "yes")
+            if _env_ig is not None
+            else bool(getattr(config, "importance_gate", False))
+        )
+        if self.use_importance_gate:
+            print("[FeatureFusion] importance gate ENABLED on geometry delta")
+
+        # Step 2'': learnable per-layer scale replacing the fixed fusion_scale.
+        # Env FUSION_LEARNABLE_SCALE overrides config.learnable_scale.
+        _env_ls = _os.environ.get("FUSION_LEARNABLE_SCALE")
+        self.use_learnable_scale = (
+            _env_ls.lower() in ("1", "true", "yes")
+            if _env_ls is not None
+            else bool(getattr(config, "learnable_scale", False))
+        )
+        if self.use_learnable_scale:
+            print(f"[FeatureFusion] learnable geometry scale ENABLED (init {self.fusion_scale})")
+
+        # Step 4: GeoThinker spatial-distance bias (only used by the SGF cross-attn
+        # operator). Env FUSION_SPATIAL_BIAS overrides config.spatial_bias.
+        _env_sb = _os.environ.get("FUSION_SPATIAL_BIAS")
+        self.use_spatial_bias = (
+            _env_sb.lower() in ("1", "true", "yes")
+            if _env_sb is not None
+            else bool(getattr(config, "spatial_bias", False))
+        )
+        if self.use_spatial_bias:
+            print("[FeatureFusion] spatial-distance bias ENABLED on SGF cross-attention")
+
         # Allow multiple fusion blocks per decoder layer (support duplicate layer indices)
         self.fusion_layers = nn.ModuleDict()
         for layer_num in self.geometry_fusion_layers:
@@ -328,14 +466,27 @@ class MultiLayerFeatureFusionModule(nn.Module):
                 # Fallback to standard LayerNorm if Qwen2RMSNorm not available
                 Qwen2RMSNorm = nn.LayerNorm
 
-            fusion_layer = nn.ModuleDict({
+            layer_modules = {
                 "geo_ln":Qwen2RMSNorm(self.geo_hidden_size, eps=1e-6),
                 "geo_mlp": nn.Sequential(
                     nn.Linear(self.geo_hidden_size * self.config.spatial_merge_size ** 2, 4096),
                     nn.GELU(),
                     nn.Linear(4096, self.lang_hidden_size),
+                ),
+            }
+            if self.use_importance_gate:
+                # Per-position salience gate conditioned on the (merged) geometry token.
+                # Input matches geo_mlp's input dim; outputs a scalar in (0, 1) per position.
+                gate_in = self.geo_hidden_size * self.config.spatial_merge_size ** 2
+                layer_modules["geo_gate"] = nn.Sequential(
+                    nn.Linear(gate_in, gate_in // 4),
+                    nn.ReLU(),
+                    nn.Linear(gate_in // 4, 1),
+                    nn.Sigmoid(),
                 )
-            })
+            if self.use_learnable_scale:
+                layer_modules["geo_scale"] = LearnableScale(self.fusion_scale)
+            fusion_layer = nn.ModuleDict(layer_modules)
         elif self.config.fusion_method == "deepstack_language_cross_attn":
             # Import here to avoid circular import
             try:
@@ -363,6 +514,28 @@ class MultiLayerFeatureFusionModule(nn.Module):
                     self.config.dropout,
                 ),
             })
+        elif self.config.fusion_method == "deepstack_language_sgf":
+            # Import here to avoid circular import
+            try:
+                from .modeling_qwen2_5_vl import Qwen2RMSNorm
+            except ImportError:
+                Qwen2RMSNorm = nn.LayerNorm
+
+            fusion_layer = nn.ModuleDict({
+                "geo_ln": Qwen2RMSNorm(self.geo_hidden_size, eps=1e-6),
+                "geo_mlp": nn.Sequential(
+                    nn.Linear(self.geo_hidden_size * self.config.spatial_merge_size ** 2, 4096),
+                    nn.GELU(),
+                    nn.Linear(4096, self.lang_hidden_size),
+                ),
+                "sgf": SGFCrossAttentionBlock(
+                    self.lang_hidden_size,
+                    self.config.num_heads,
+                    self.config.dropout,
+                    use_importance_gate=self.use_importance_gate,
+                    use_spatial_bias=self.use_spatial_bias,
+                ),
+            })
         else:
             raise ValueError(f"Unknown fusion type: {self.config.fusion_method}")
 
@@ -373,6 +546,19 @@ class MultiLayerFeatureFusionModule(nn.Module):
             for fusion_layers in self.fusion_layers.values():
                 for fusion_layer in fusion_layers:
                     self._zero_init_last_linear(fusion_layer["geo_mlp"])
+                    if "geo_gate" in fusion_layer:
+                        self._open_init_gate(fusion_layer["geo_gate"])
+                    if "geo_scale" in fusion_layer:
+                        # Re-assert the init (pre-load); a trained value overrides on load.
+                        with torch.no_grad():
+                            fusion_layer["geo_scale"].scale.fill_(self.fusion_scale)
+        elif self.config.fusion_method == "deepstack_language_sgf":
+            # tanh(gate)=0 makes the SGF cross-attention a no-op at init (pre-load;
+            # a trained gate overrides on load).
+            for fusion_layers in self.fusion_layers.values():
+                for fusion_layer in fusion_layers:
+                    with torch.no_grad():
+                        fusion_layer["sgf"].gate.zero_()
 
     @staticmethod
     def _zero_init_last_linear(module: nn.Module) -> None:
@@ -383,6 +569,19 @@ class MultiLayerFeatureFusionModule(nn.Module):
                     nn.init.zeros_(layer.bias)
                 return
 
+    @staticmethod
+    def _open_init_gate(module: nn.Module, bias_value: float = 4.0) -> None:
+        # Init the sigmoid gate ~open (g≈sigmoid(4)≈0.98): zero weight makes it
+        # uniform, positive bias pushes it toward 1 so early training ≈ ungated add
+        # and the gate then LEARNS which geometry to suppress. (Step-0 loss parity is
+        # already guaranteed by the zero-init geo_mlp, independent of the gate.)
+        for layer in reversed(list(module.modules())):
+            if isinstance(layer, nn.Linear):
+                nn.init.zeros_(layer.weight)
+                if layer.bias is not None:
+                    nn.init.constant_(layer.bias, bias_value)
+                return
+
     def forward(
         self, 
         features_2d: torch.Tensor,
@@ -391,6 +590,7 @@ class MultiLayerFeatureFusionModule(nn.Module):
         vis_pos_embed: Optional[torch.Tensor] = None,
         geo_pos_embed: Optional[torch.Tensor] = None,
         fusion_layer_idx: Optional[int] = None,
+        grid_hw: Optional[tuple] = None,
     ) -> torch.Tensor:
         """
         Fuse 2D and 3D features.
@@ -445,8 +645,16 @@ class MultiLayerFeatureFusionModule(nn.Module):
             elif self.config.fusion_method == "deepstack_language_add":
                 geo_feats = fusion_layer['geo_ln'](features_3d_list[geo_idx])
                 geo_feats = geo_feats.reshape(-1, self.config.geo_hidden_size * self.config.spatial_merge_size ** 2)
-                geo_feats = fusion_layer['geo_mlp'](geo_feats)
-                features_2d = features_2d + self.fusion_scale * geo_feats
+                delta = fusion_layer['geo_mlp'](geo_feats)
+                if 'geo_gate' in fusion_layer:
+                    # Per-position salience g in (0,1) from the geometry token; suppresses
+                    # redundant background geometry (floor/wall/empty) before it is added.
+                    delta = fusion_layer['geo_gate'](geo_feats) * delta
+                if 'geo_scale' in fusion_layer:
+                    # Step 2'': learnable per-layer scale replaces the fixed fusion_scale.
+                    features_2d = features_2d + fusion_layer['geo_scale'](delta)
+                else:
+                    features_2d = features_2d + self.fusion_scale * delta
 
             elif self.config.fusion_method == "deepstack_language_cross_attn":
                 geo_feats = features_3d_list[geo_idx]
@@ -470,6 +678,20 @@ class MultiLayerFeatureFusionModule(nn.Module):
                 features_2d = features_2d.reshape(num_imgs, num_merged_patch_tokens, -1)
                 features_2d = fusion_layer['cross_attn'](features_2d, geo_feats, vis_pos_embed, geo_pos_embed)
                 features_2d = features_2d.reshape(num_imgs * num_merged_patch_tokens, -1)
+
+            elif self.config.fusion_method == "deepstack_language_sgf":
+                # Step 2 + (opt) 3/4: GeoThinker SGF on the language path.
+                # Assumes patch-only geometry (include_camera_token=False): T == num_merged * m^2.
+                geo_feats = features_3d_list[geo_idx]
+                num_imgs = geo_feats.shape[0]
+                num_merged = features_2d.shape[0] // num_imgs
+                geo_feats = fusion_layer['geo_ln'](geo_feats)
+                geo_feats = geo_feats.reshape(-1, self.config.geo_hidden_size * self.config.spatial_merge_size ** 2)
+                geo_feats = fusion_layer['geo_mlp'](geo_feats)
+                geo_feats = geo_feats.reshape(num_imgs, num_merged, -1)         # K/V: geometry, per frame
+                vis = features_2d.reshape(num_imgs, num_merged, -1)             # Q: vision, per frame (frame-strict)
+                delta = fusion_layer['sgf'](vis, geo_feats, grid_hw=grid_hw)    # tanh(gate)-scaled delta
+                features_2d = features_2d + delta.reshape(num_imgs * num_merged, -1)
             else:
                 raise ValueError(f"Unknown fusion method: {self.fusion_method}")
 

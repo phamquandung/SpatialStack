@@ -57,6 +57,10 @@ export GEOMETRY_FUSION_LAYERS="${GEOMETRY_FUSION_LAYERS:-0 1 2}"
 export GEOMETRY_ENCODER_LAYERS="${GEOMETRY_ENCODER_LAYERS:-11 17 23}"   
 export GEOMETRY_FUSION_SCALE="${GEOMETRY_FUSION_SCALE:-0.5}"            # JanusVLN-style lam on the geometry delta
 export GEOMETRY_FRAME_STRICT="${GEOMETRY_FRAME_STRICT:-true}"          # Step 1 fusion migration: per-frame geometry (default off = baseline broadcast)
+export GEOMETRY_IMPORTANCE_GATE="${GEOMETRY_IMPORTANCE_GATE:-false}"    # Step 2' fusion migration: per-position gate suppressing background geometry (default off)
+export GEOMETRY_LEARNABLE_SCALE="${GEOMETRY_LEARNABLE_SCALE:-false}"    # Step 2'' fusion migration: learnable per-layer geometry scale (default off)
+export FEATURE_FUSION_METHOD="${FEATURE_FUSION_METHOD:-deepstack_language_add}"  # deepstack_language_add (Steps 1/2'/2'') | deepstack_language_sgf (Step 2 cross-attn + 3/4)
+export GEOMETRY_SPATIAL_BIAS="${GEOMETRY_SPATIAL_BIAS:-false}"          # Step 4 fusion migration: spatial-distance bias on SGF cross-attn (default off)
 export STOP_LOSS_WEIGHT="${STOP_LOSS_WEIGHT:-1}"                        # 1 = none (JanusVLN handles the 1.26% STOP imbalance unweighted); raise only if STOP still under-fires
 
 # --- Weights & Biases (offline; sync later with `wandb sync`) ---
@@ -87,7 +91,8 @@ echo "TOTAL_BATCH_SIZE=${TOTAL_BATCH_SIZE}"
 echo "DATASETS=${DATASETS}"
 echo "GEOMETRY_FUSION_LAYERS=${GEOMETRY_FUSION_LAYERS}  GEOMETRY_ENCODER_LAYERS=${GEOMETRY_ENCODER_LAYERS}"
 echo "GEOMETRY_FUSION_SCALE=${GEOMETRY_FUSION_SCALE}  STOP_LOSS_WEIGHT=${STOP_LOSS_WEIGHT}"
-echo "GEOMETRY_FRAME_STRICT=${GEOMETRY_FRAME_STRICT}"
+echo "GEOMETRY_FRAME_STRICT=${GEOMETRY_FRAME_STRICT}  GEOMETRY_IMPORTANCE_GATE=${GEOMETRY_IMPORTANCE_GATE}  GEOMETRY_LEARNABLE_SCALE=${GEOMETRY_LEARNABLE_SCALE}"
+echo "FEATURE_FUSION_METHOD=${FEATURE_FUSION_METHOD}  GEOMETRY_SPATIAL_BIAS=${GEOMETRY_SPATIAL_BIAS}"
 echo "REPORT_TO=${REPORT_TO}"
 echo "WANDB_MODE=${WANDB_MODE}"
 echo "WANDB_PROJECT=${WANDB_PROJECT}"

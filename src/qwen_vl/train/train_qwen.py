@@ -228,6 +228,9 @@ def train(attn_implementation="flash_attention_2"):
                 "geometry_encoder_streaming",
                 "geometry_fusion_scale",
                 "geometry_frame_strict",
+                "geometry_importance_gate",
+                "geometry_learnable_scale",
+                "geometry_spatial_bias",
             ]:
                 setattr(config, k, getattr(model_args, k))
 

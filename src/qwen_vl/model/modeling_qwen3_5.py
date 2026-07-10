@@ -428,12 +428,18 @@ class Qwen3_5TextModelWithGeometry(Qwen3_5TextModel):
                         geo_shape=geo_shape,
                         tiling_factor=tiling,
                     )
+                # Per-frame merged grid (h, w) for the SGF spatial-distance bias (Step 4).
+                sgf_grid_hw = None
+                if grid_thw is not None and len(grid_thw) > 0:
+                    _gh, _gw = grid_thw[0][1:].tolist()
+                    sgf_grid_hw = (_gh // merge_size, _gw // merge_size)
                 fused = fusion_module(
                     vision_tokens,
                     geo_feats,
                     layer_idx,
                     vis_pos_embed_per_image,
                     geo_pos_embed_per_image,
+                    grid_hw=sgf_grid_hw,
                 )
                 hidden_states = hidden_states.clone()
                 hidden_states[vision_token_mask] = fused
@@ -476,7 +482,7 @@ class Qwen3_5ModelWithGeometry(Qwen3_5Model):
 
     def _validate_geometry_config(self, config):
         fusion_method = getattr(config, "feature_fusion_method", "deepstack_language_add")
-        if fusion_method == "deepstack_language_add":
+        if fusion_method in ("deepstack_language_add", "deepstack_language_sgf"):
             if not getattr(config, "geometry_fusion_layers", None):
                 raise ValueError("Qwen3.5 geometry fusion requires geometry_fusion_layers to be set.")
             if (
@@ -516,7 +522,7 @@ class Qwen3_5ModelWithGeometry(Qwen3_5Model):
             freeze_encoder=encoder_config.freeze_encoder,
         )
 
-        if fusion_method == "deepstack_language_add":
+        if fusion_method in ("deepstack_language_add", "deepstack_language_sgf"):
             use_vision_language_fusion = getattr(config, "vision_language_fusion_layers", None) is not None
             fusion_config = MultiLayerFeatureFusionConfig(
                 fusion_method=fusion_method,
@@ -533,6 +539,9 @@ class Qwen3_5ModelWithGeometry(Qwen3_5Model):
                 num_heads=getattr(config, "fusion_attention_heads", 8),
                 dropout=getattr(config, "fusion_dropout", 0.1),
                 fusion_scale=getattr(config, "geometry_fusion_scale", 1.0),
+                importance_gate=getattr(config, "geometry_importance_gate", False),
+                learnable_scale=getattr(config, "geometry_learnable_scale", False),
+                spatial_bias=getattr(config, "geometry_spatial_bias", False),
             )
             self.language_feature_fusion = MultiLayerFeatureFusionModule(fusion_config)
             self.language_feature_fusion.apply(self._init_weights)

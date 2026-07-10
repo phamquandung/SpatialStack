@@ -26,6 +26,9 @@ class ModelArguments:
     geometry_encoder_streaming: bool = field(default=False)  # JanusVLN-style frame-by-frame VGGT KV cache
     geometry_fusion_scale: float = field(default=1.0)  # JanusVLN-style lam on the geometry delta (saved to config)
     geometry_frame_strict: bool = field(default=False)  # Fuse each frame with its OWN geometry (vs last-frame broadcast). Env FUSION_FRAME_STRICT overrides.
+    geometry_importance_gate: bool = field(default=False)  # Step 2': per-position sigmoid gate on the geometry delta (background suppression). Env FUSION_IMPORTANCE_GATE overrides.
+    geometry_learnable_scale: bool = field(default=False)  # Step 2'': learnable per-layer scale replacing fixed geometry_fusion_scale. Env FUSION_LEARNABLE_SCALE overrides.
+    geometry_spatial_bias: bool = field(default=False)  # Step 4: GeoThinker spatial-distance bias on the SGF cross-attention (deepstack_language_sgf only). Env FUSION_SPATIAL_BIAS overrides.
     stop_loss_weight: float = field(default=1.0)  # Up-weight STOP-action tokens in the LM loss (exposure-bias fix)
 
 @dataclass

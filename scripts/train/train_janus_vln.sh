@@ -106,11 +106,14 @@ USE_GEOMETRY_ENCODER="${USE_GEOMETRY_ENCODER:-true}"
 GEOMETRY_ENCODER_STREAMING="${GEOMETRY_ENCODER_STREAMING:-true}"
 FEATURE_FUSION_METHOD="${FEATURE_FUSION_METHOD:-deepstack_language_add}"
 GEOMETRY_FUSION_LAYERS="${GEOMETRY_FUSION_LAYERS:-0 1 2}"
-GEOMETRY_ENCODER_LAYERS="${GEOMETRY_ENCODER_LAYERS:-3 7 11}"
+GEOMETRY_ENCODER_LAYERS="${GEOMETRY_ENCODER_LAYERS:-11 17 23}"
 REFERENCE_FRAME="${REFERENCE_FRAME:-first}"
 GEOMETRY_FUSION_SCALE="${GEOMETRY_FUSION_SCALE:-0.5}"   # JanusVLN-style lam on geometry delta (saved to config)
 GEOMETRY_FRAME_STRICT="${GEOMETRY_FRAME_STRICT:-true}" # Step 1: per-frame geometry vs last-frame broadcast (default off = baseline)
-STOP_LOSS_WEIGHT="${STOP_LOSS_WEIGHT:-3.0}"            # up-weight STOP tokens in LM loss (exposure-bias fix)
+GEOMETRY_IMPORTANCE_GATE="${GEOMETRY_IMPORTANCE_GATE:-false}" # Step 2': per-position gate suppressing background geometry (default off)
+GEOMETRY_LEARNABLE_SCALE="${GEOMETRY_LEARNABLE_SCALE:-false}" # Step 2'': learnable per-layer geometry scale, init = fusion_scale (default off)
+GEOMETRY_SPATIAL_BIAS="${GEOMETRY_SPATIAL_BIAS:-false}"       # Step 4: spatial-distance bias (only used when FEATURE_FUSION_METHOD=deepstack_language_sgf)
+STOP_LOSS_WEIGHT="${STOP_LOSS_WEIGHT:-1.0}"            # up-weight STOP tokens in LM loss (exposure-bias fix)
 REPORT_TO="${REPORT_TO:-none}"
 
 DATALOADER_NUM_WORKERS="${DATALOADER_NUM_WORKERS:-8}"
@@ -173,6 +176,9 @@ if [[ "${USE_GEOMETRY_ENCODER,,}" == "true" ]]; then
         --geometry_encoder_layers ${GEOMETRY_ENCODER_LAYERS}
         --geometry_fusion_scale "$GEOMETRY_FUSION_SCALE"
         --geometry_frame_strict "$GEOMETRY_FRAME_STRICT"
+        --geometry_importance_gate "$GEOMETRY_IMPORTANCE_GATE"
+        --geometry_learnable_scale "$GEOMETRY_LEARNABLE_SCALE"
+        --geometry_spatial_bias "$GEOMETRY_SPATIAL_BIAS"
         --stop_loss_weight "$STOP_LOSS_WEIGHT"
     )
 fi
