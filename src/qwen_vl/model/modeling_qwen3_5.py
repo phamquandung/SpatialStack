@@ -704,13 +704,17 @@ class Qwen3_5ModelWithGeometry(Qwen3_5Model):
                 torch.save([t.detach().to(torch.float16).cpu() for t in layer_features], cache_path)
 
         if os.environ.get("FUSION_DEBUG_SHAPES") and not getattr(self, "_fusion_shape_logged", False):
-            self._fusion_shape_logged = True
-            _shp = tuple(layer_features[0].shape) if layer_features else None
-            print(
-                f"[fusion-debug] frame_strict={frame_strict} streaming={use_streaming} "
-                f"geo_input_frames={int(geometry_encoder_inputs[0].shape[0])} per_layer_geo={_shp}  "
-                f"# expect [N,T,2048] frame-strict, [1,T,2048] broadcast"
-            )
+            _n_geo_frames = int(geometry_encoder_inputs[0].shape[0])
+            # Skip the uninformative single-frame case (e.g. VLN step 0) under frame-strict:
+            # wait for a multi-frame window so [N,T,2048] is distinguishable from broadcast.
+            if (not frame_strict) or _n_geo_frames > 1:
+                self._fusion_shape_logged = True
+                _shp = tuple(layer_features[0].shape) if layer_features else None
+                print(
+                    f"[fusion-debug] frame_strict={frame_strict} streaming={use_streaming} "
+                    f"geo_input_frames={_n_geo_frames} per_layer_geo={_shp}  "
+                    f"# expect [N,T,2048] frame-strict, [1,T,2048] broadcast"
+                )
 
         geometry_layer_features: Dict[int, List[torch.Tensor]] = {}
         for layer_idx, layer_feature in zip(fusion_layers, layer_features):

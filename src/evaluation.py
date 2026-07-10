@@ -387,7 +387,8 @@ class SpatialStackVLN_Inference:
                 # Broadcast: streaming eval encodes only the current frame, tiled to
                 # all frames. Built at the same grid resolution as in training.
                 model_inputs["geometry_encoder_inputs"] = [geo_list[-1].unsqueeze(0)]
-            if not getattr(self, "_geom_debug_logged", False) and get_rank() == 0:
+            if (not getattr(self, "_geom_debug_logged", False)
+                    and get_rank() == 0 and len(observations) > 1):   # skip step-0 single-frame (uninformative)
                 self._geom_debug_logged = True
                 geo = model_inputs["geometry_encoder_inputs"][0]
                 print(
