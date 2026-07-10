@@ -261,18 +261,18 @@ class SpatialStackVLN_Inference:
                 stacklevel=2,
             )
         if self.use_geometry and self.use_geometry_streaming:
+            # Persistent growing VGGT KV either way (accumulated 3D memory over the episode).
+            self.model.enable_vln_eval_streaming()
             if self.use_frame_strict:
-                # Frame-strict: feed ALL frames' geometry each step and encode them
-                # per-frame via the training-style encode_layers_streaming path (so
-                # frame i fuses its own geometry). Do NOT enable single-frame eval
-                # streaming, which would encode only the current frame and broadcast it.
+                # Incremental frame-strict: encode only the new frame each step against the
+                # growing KV, buffer its geometry, and gather each window frame's OWN
+                # buffered geometry (per-frame fusion, no broadcast). Fast + full history.
+                self.model.enable_vln_frame_strict_eval()
                 warnings.warn(
-                    "Frame-strict eval: encoding all history frames' geometry per step "
-                    "to match frame-strict training (re-encodes the window each step).",
+                    "Frame-strict eval (incremental): per-frame geometry from a growing-KV "
+                    "buffer; encodes 1 frame/step and gathers the window per-frame.",
                     stacklevel=2,
                 )
-            else:
-                self.model.enable_vln_eval_streaming()
         elif not self.use_geometry:
             warnings.warn(
                 "Checkpoint has use_geometry_encoder=False; running vision-only VLN eval.",
@@ -378,35 +378,29 @@ class SpatialStackVLN_Inference:
             "image_grid_thw": torch.stack(grids, dim=0),
         }
         if self.use_geometry:
-            if self.use_frame_strict:
-                # Frame-strict: all frames' geometry [N, C, H, W] -> encoder returns
-                # per-frame features [N, T, 2048], each fused with its own frame's
-                # vision tokens (no broadcast). Matches frame-strict training.
-                model_inputs["geometry_encoder_inputs"] = [torch.stack(geo_list, dim=0)]
-            else:
-                # Broadcast: streaming eval encodes only the current frame, tiled to
-                # all frames. Built at the same grid resolution as in training.
-                model_inputs["geometry_encoder_inputs"] = [geo_list[-1].unsqueeze(0)]
+            # Both modes encode only the CURRENT frame each step (growing KV). Broadcast
+            # tiles it to all frames; frame-strict buffers it and gathers each window
+            # frame's own geometry (window indices set on the model before generate).
+            model_inputs["geometry_encoder_inputs"] = [geo_list[-1].unsqueeze(0)]
             if (not getattr(self, "_geom_debug_logged", False)
                     and get_rank() == 0 and len(observations) > 1):   # skip step-0 single-frame (uninformative)
                 self._geom_debug_logged = True
-                geo = model_inputs["geometry_encoder_inputs"][0]
                 print(
-                    f"[eval-geom] frame_strict={self.use_frame_strict} "
-                    f"vision_frames={len(observations)} geom_frames={int(geo.shape[0])} "
-                    f"geom_input={tuple(geo.shape)}"
+                    f"[eval-geom] frame_strict={self.use_frame_strict} (incremental) "
+                    f"vision_frames={len(observations)} geom_encoded_this_step=1 "
+                    f"(frame-strict gathers {len(observations)} frames from the buffer)"
                 )
-                if self.use_frame_strict and int(geo.shape[0]) != len(observations):
-                    warnings.warn(
-                        "Frame-strict eval expected one geometry frame per vision frame; "
-                        f"got geom_frames={int(geo.shape[0])} vs vision_frames={len(observations)}.",
-                        stacklevel=2,
-                    )
         return model_inputs
 
-    def call_model(self, observations, task: str, step_id: int, gen_kwargs: Optional[dict] = None):
+    def call_model(self, observations, task: str, step_id: int, gen_kwargs: Optional[dict] = None,
+                   frame_indices=None):
         del step_id
         gen_kwargs = gen_kwargs or {}
+
+        # Incremental frame-strict: tell the encoder which trajectory frames the LLM
+        # window contains, so it gathers each one's own buffered geometry this step.
+        if self.use_geometry and self.use_frame_strict and frame_indices is not None:
+            self.model.set_vln_eval_window_indices(frame_indices)
 
         model_inputs = self._build_model_inputs(observations, task)
 
@@ -644,13 +638,15 @@ class VLNEvaluator:
                     info = env.get_metrics()
                     history_len = len(rgb_list) - 1
                     if history_len <= self.num_history:
-                        images = rgb_list[:history_len] + [rgb_list[-1]]
+                        frame_indices = list(range(len(rgb_list)))          # all frames so far
                     else:
-                        indices = np.linspace(0, history_len, self.num_history + 1, dtype=int)
-                        images = [rgb_list[i] for i in indices]
+                        frame_indices = np.linspace(0, history_len, self.num_history + 1, dtype=int).tolist()
+                    images = [rgb_list[i] for i in frame_indices]
 
                     step_t0 = time.perf_counter()
-                    action = self.model.call_model(images, episode_instruction, step_id)[0]
+                    action = self.model.call_model(
+                        images, episode_instruction, step_id, frame_indices=frame_indices
+                    )[0]
                     if torch.cuda.is_available():
                         torch.cuda.synchronize(self.device)
                     step_times_ms.append((time.perf_counter() - step_t0) * 1000)

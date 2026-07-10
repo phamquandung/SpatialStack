@@ -78,6 +78,11 @@ class VGGTEncoder(BaseGeometryEncoder):
         self._streaming_past_key_values = None
         self._streaming_frame_idx = 0
         self.last_vggt_ms = 0.0
+        # Incremental frame-strict eval: buffer each frame's geometry (computed with the
+        # growing KV) and return the requested window per-frame, instead of broadcasting.
+        self._eval_frame_strict = False
+        self._eval_window_indices = None
+        self._frame_feature_buffer = None
         # Eval-time VGGT KV-cache window (in frames). Defaults match JanusVLN (8+48=56).
         # Override via env to test the long-horizon geometry-drift hypothesis, e.g.
         # VGGT_KV_START=1 VGGT_KV_RECENT=8 caps the cache at 9 frames (training horizon).
@@ -90,10 +95,23 @@ class VGGTEncoder(BaseGeometryEncoder):
     def set_eval_streaming(self, enabled: bool) -> None:
         self._eval_streaming = bool(enabled)
 
+    def set_eval_frame_strict(self, enabled: bool) -> None:
+        """Incremental frame-strict eval: buffer each frame's geometry (encoded with the
+        growing KV) and return the requested window per-frame instead of broadcasting."""
+        self._eval_frame_strict = bool(enabled)
+        if enabled and self._frame_feature_buffer is None:
+            self._frame_feature_buffer = []
+
+    def set_eval_window_indices(self, indices) -> None:
+        """Trajectory frame indices to gather from the per-frame buffer this step."""
+        self._eval_window_indices = list(indices) if indices is not None else None
+
     def reset_streaming_cache(self) -> None:
         self._streaming_past_key_values = None
         self._streaming_frame_idx = 0
         self.last_vggt_ms = 0.0
+        self._frame_feature_buffer = [] if self._eval_frame_strict else None
+        self._eval_window_indices = None
         
     
     def encode(self, images: torch.Tensor) -> torch.Tensor:
@@ -427,6 +445,24 @@ class VGGTEncoder(BaseGeometryEncoder):
                 dtype=dtype,
             )
             tensor_features.append(geo_feature)
+
+        if self._eval_frame_strict:
+            # Buffer this frame's per-layer features on CPU (it was encoded with the
+            # growing KV), then return the requested window gathered PER-FRAME. Each
+            # buffered frame i == trajectory frame i (one frame encoded per step).
+            if self._frame_feature_buffer is None:
+                self._frame_feature_buffer = []
+            self._frame_feature_buffer.append([t.detach().to("cpu") for t in tensor_features])
+            n_buf = len(self._frame_feature_buffer)
+            window = self._eval_window_indices
+            window = [i for i in window if 0 <= i < n_buf] if window else [n_buf - 1]
+            if not window:
+                window = [n_buf - 1]
+            gathered = []
+            for layer_pos in range(len(tensor_features)):
+                frames = [self._frame_feature_buffer[i][layer_pos] for i in window]
+                gathered.append(torch.cat(frames, dim=0).to(tensor_features[layer_pos].device))
+            tensor_features = gathered
 
         from qwen_vl.debug import vln_debug
 

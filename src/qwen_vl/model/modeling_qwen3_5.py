@@ -704,15 +704,15 @@ class Qwen3_5ModelWithGeometry(Qwen3_5Model):
                 torch.save([t.detach().to(torch.float16).cpu() for t in layer_features], cache_path)
 
         if os.environ.get("FUSION_DEBUG_SHAPES") and not getattr(self, "_fusion_shape_logged", False):
-            _n_geo_frames = int(geometry_encoder_inputs[0].shape[0])
+            _shp = tuple(layer_features[0].shape) if layer_features else None
+            _n_out = _shp[0] if _shp else 0   # frames of geometry actually returned to fusion
             # Skip the uninformative single-frame case (e.g. VLN step 0) under frame-strict:
-            # wait for a multi-frame window so [N,T,2048] is distinguishable from broadcast.
-            if (not frame_strict) or _n_geo_frames > 1:
+            # wait until the returned geometry spans a multi-frame window.
+            if (not frame_strict) or _n_out > 1:
                 self._fusion_shape_logged = True
-                _shp = tuple(layer_features[0].shape) if layer_features else None
                 print(
                     f"[fusion-debug] frame_strict={frame_strict} streaming={use_streaming} "
-                    f"geo_input_frames={_n_geo_frames} per_layer_geo={_shp}  "
+                    f"geo_input_frames={int(geometry_encoder_inputs[0].shape[0])} per_layer_geo={_shp}  "
                     f"# expect [N,T,2048] frame-strict, [1,T,2048] broadcast"
                 )
 
@@ -934,6 +934,18 @@ class Qwen3_5ForConditionalGenerationWithGeometry(Qwen3_5ForConditionalGeneratio
         encoder = getattr(self.model, "geometry_encoder", None)
         if encoder is not None and hasattr(encoder, "set_eval_streaming"):
             encoder.set_eval_streaming(True)
+
+    def enable_vln_frame_strict_eval(self) -> None:
+        """Incremental frame-strict eval: per-frame geometry from a buffer, encoded with
+        the growing VGGT KV. Requires enable_vln_eval_streaming() for the persistent KV."""
+        encoder = getattr(self.model, "geometry_encoder", None)
+        if encoder is not None and hasattr(encoder, "set_eval_frame_strict"):
+            encoder.set_eval_frame_strict(True)
+
+    def set_vln_eval_window_indices(self, indices) -> None:
+        encoder = getattr(self.model, "geometry_encoder", None)
+        if encoder is not None and hasattr(encoder, "set_eval_window_indices"):
+            encoder.set_eval_window_indices(indices)
 
     @staticmethod
     def _stop_weighted_loss(logits, labels, stop_token_ids, stop_weight):
