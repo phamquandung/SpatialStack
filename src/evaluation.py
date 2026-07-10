@@ -244,6 +244,16 @@ class SpatialStackVLN_Inference:
         self.model = Qwen3_5ForConditionalGenerationWithGeometry.from_pretrained(**model_kwargs).eval()
         self.use_geometry = getattr(config, "use_geometry_encoder", False)
         self.use_geometry_streaming = getattr(config, "geometry_encoder_streaming", False)
+        # Frame-strict eval: fuse each frame with its OWN geometry (as trained), instead
+        # of broadcasting the current frame. Env FUSION_FRAME_STRICT overrides config,
+        # using the SAME resolution as the model's _collect_geometry_layer_features so
+        # the eval wrapper and the model agree.
+        _env_fs = os.environ.get("FUSION_FRAME_STRICT")
+        self.use_frame_strict = (
+            _env_fs.lower() in ("1", "true", "yes")
+            if _env_fs is not None
+            else bool(getattr(config, "geometry_frame_strict", False))
+        )
         if self.use_geometry and not self.use_geometry_streaming:
             warnings.warn(
                 "Checkpoint has use_geometry_encoder=True but geometry_encoder_streaming=False. "
@@ -251,7 +261,18 @@ class SpatialStackVLN_Inference:
                 stacklevel=2,
             )
         if self.use_geometry and self.use_geometry_streaming:
-            self.model.enable_vln_eval_streaming()
+            if self.use_frame_strict:
+                # Frame-strict: feed ALL frames' geometry each step and encode them
+                # per-frame via the training-style encode_layers_streaming path (so
+                # frame i fuses its own geometry). Do NOT enable single-frame eval
+                # streaming, which would encode only the current frame and broadcast it.
+                warnings.warn(
+                    "Frame-strict eval: encoding all history frames' geometry per step "
+                    "to match frame-strict training (re-encodes the window each step).",
+                    stacklevel=2,
+                )
+            else:
+                self.model.enable_vln_eval_streaming()
         elif not self.use_geometry:
             warnings.warn(
                 "Checkpoint has use_geometry_encoder=False; running vision-only VLN eval.",
@@ -357,9 +378,29 @@ class SpatialStackVLN_Inference:
             "image_grid_thw": torch.stack(grids, dim=0),
         }
         if self.use_geometry:
-            # Streaming eval encodes only the current frame; its geometry tensor is
-            # built at the same grid resolution as in training.
-            model_inputs["geometry_encoder_inputs"] = [geo_list[-1].unsqueeze(0)]
+            if self.use_frame_strict:
+                # Frame-strict: all frames' geometry [N, C, H, W] -> encoder returns
+                # per-frame features [N, T, 2048], each fused with its own frame's
+                # vision tokens (no broadcast). Matches frame-strict training.
+                model_inputs["geometry_encoder_inputs"] = [torch.stack(geo_list, dim=0)]
+            else:
+                # Broadcast: streaming eval encodes only the current frame, tiled to
+                # all frames. Built at the same grid resolution as in training.
+                model_inputs["geometry_encoder_inputs"] = [geo_list[-1].unsqueeze(0)]
+            if not getattr(self, "_geom_debug_logged", False) and get_rank() == 0:
+                self._geom_debug_logged = True
+                geo = model_inputs["geometry_encoder_inputs"][0]
+                print(
+                    f"[eval-geom] frame_strict={self.use_frame_strict} "
+                    f"vision_frames={len(observations)} geom_frames={int(geo.shape[0])} "
+                    f"geom_input={tuple(geo.shape)}"
+                )
+                if self.use_frame_strict and int(geo.shape[0]) != len(observations):
+                    warnings.warn(
+                        "Frame-strict eval expected one geometry frame per vision frame; "
+                        f"got geom_frames={int(geo.shape[0])} vs vision_frames={len(observations)}.",
+                        stacklevel=2,
+                    )
         return model_inputs
 
     def call_model(self, observations, task: str, step_id: int, gen_kwargs: Optional[dict] = None):
