@@ -47,7 +47,7 @@ export GEOMETRY_ENCODER_PATH="${GEOMETRY_ENCODER_PATH:-/mnt/data/vmo-ai-task/dun
 export DATASETS="${DATASETS:-train_r2r_rxr%100}"
 export TOTAL_BATCH_SIZE="${TOTAL_BATCH_SIZE:-64}"
 export LR="${LR:-2e-5}"
-export OUTPUT_DIR="${OUTPUT_DIR:-/mnt/data/vmo-ai-task/dungpq6/model-checkpoint/vln_fix}"   # fresh dir per recipe (avoid resuming the old run)
+export OUTPUT_DIR="${OUTPUT_DIR:-/mnt/data/vmo-ai-task/dungpq6/model-checkpoint/spatialstack_janus_vln_train-gate-scale}"   # fresh dir per recipe (avoid resuming the old run)
 export CACHE_DIR="${CACHE_DIR:-${PROJECT_ROOT}/cache}"
 
 # --- Geometry fusion recipe (STOP-collapse fix) ---
