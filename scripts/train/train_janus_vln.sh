@@ -110,8 +110,8 @@ GEOMETRY_ENCODER_LAYERS="${GEOMETRY_ENCODER_LAYERS:-11 17 23}"
 REFERENCE_FRAME="${REFERENCE_FRAME:-first}"
 GEOMETRY_FUSION_SCALE="${GEOMETRY_FUSION_SCALE:-0.5}"   # JanusVLN-style lam on geometry delta (saved to config)
 GEOMETRY_FRAME_STRICT="${GEOMETRY_FRAME_STRICT:-true}" # Step 1: per-frame geometry vs last-frame broadcast (default off = baseline)
-GEOMETRY_IMPORTANCE_GATE="${GEOMETRY_IMPORTANCE_GATE:-false}" # Step 2': per-position gate suppressing background geometry (default off)
-GEOMETRY_LEARNABLE_SCALE="${GEOMETRY_LEARNABLE_SCALE:-false}" # Step 2'': learnable per-layer geometry scale, init = fusion_scale (default off)
+GEOMETRY_IMPORTANCE_GATE="${GEOMETRY_IMPORTANCE_GATE:-true}" # Step 2': per-position gate suppressing background geometry (default off)
+GEOMETRY_LEARNABLE_SCALE="${GEOMETRY_LEARNABLE_SCALE:-true}" # Step 2'': learnable per-layer geometry scale, init = fusion_scale (default off)
 GEOMETRY_SPATIAL_BIAS="${GEOMETRY_SPATIAL_BIAS:-false}"       # Step 4: spatial-distance bias (only used when FEATURE_FUSION_METHOD=deepstack_language_sgf)
 STOP_LOSS_WEIGHT="${STOP_LOSS_WEIGHT:-1.0}"            # up-weight STOP tokens in LM loss (exposure-bias fix)
 REPORT_TO="${REPORT_TO:-none}"
