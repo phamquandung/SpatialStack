@@ -17,3 +17,5 @@ hf_cache/
 /models/
 /vsibench/
 sam_hq_vit_h.pth
+evaluation/
+evaluation_*/

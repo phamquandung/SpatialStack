@@ -29,11 +29,6 @@ from habitat.utils.visualizations.utils import images_to_video, observations_to_
 from habitat_extensions import measures  # noqa: F401
 from utils.dist import get_rank, get_world_size, init_distributed_mode
 from qwen_vl.model.modeling_qwen3_5 import Qwen3_5ForConditionalGenerationWithGeometry
-from qwen_vl.data.utils import prepare_image_inputs
-from qwen_vl.data.data_qwen import (
-    _build_training_tokenizer,
-    _apply_training_chat_template,
-)
 
 try:
     import torch.distributed as dist
@@ -43,23 +38,23 @@ except ImportError:
 MIN_QWEN3_5_TRANSFORMERS_VERSION = Version("5.3.0")
 MIN_PIXELS = 256 * 28 * 28
 MAX_PIXELS = 1605632
-TRAINING_SYSTEM_PROMPT = "You are a helpful assistant."
 ACTION_NAMES = ("STOP", "MOVE_FORWARD", "TURN_LEFT", "TURN_RIGHT")
 
-# Exact training prompt (see scripts/data/create_janus_vln_data.py::VLN_PROMPT).
-# History <image> tags + one current <image> are inserted so the tokenized prompt
-# matches training byte-for-byte.
-VLN_PROMPT = (
+VLN_SYSTEM_PROMPT = (
     "You are a visual language navigation model, and your should go to the locations "
     "to complete the given task. Compare the observation and instruction to infer "
     "your current progress, and then select the correct direction from the candidates "
-    "to go to the target location and finish the task.\n"
-    " This is your historical observation:{his_img_tags}\n"
-    " This is your current observation:<image>\n"
-    " Your task is to {instruction}\n"
-    " You should take one of the following actions:\n"
-    " MOVE_FORWARD\n TURN_LEFT\n TURN_RIGHT\n STOP."
+    "to go to the target location and finish the task."
 )
+
+
+def build_vln_context(task: str) -> str:
+    return (
+        "These images are your historical observations and your current observation.\n"
+        f" Your task is to {task} \n"
+        " You should take one of the following actions:\n"
+        " MOVE_FORWARD\n TURN_LEFT\n TURN_RIGHT\n STOP."
+    )
 
 
 def set_seed(seed: int):
@@ -137,39 +132,17 @@ def strip_thinking_content(text: str) -> str:
     return text.strip()
 
 
-def build_training_style_vln_messages(observations, task: str):
-    """Match create_janus_vln_data.py / preprocess_qwen_2_visual training layout."""
+def build_vln_messages(observations, task: str):
+    """Build the multimodal prompt in the same layout as JanusVLN evaluation."""
     if not observations:
         raise ValueError("At least one observation image is required.")
+    if not all(isinstance(image, Image.Image) for image in observations):
+        raise TypeError("All observations must be PIL images.")
 
-    content = [
-        {
-            "type": "text",
-            "text": (
-                "You are a visual language navigation model, and your should go to the locations "
-                "to complete the given task. Compare the observation and instruction to infer "
-                "your current progress, and then select the correct direction from the candidates "
-                "to go to the target location and finish the task.\n"
-                " This is your historical observation:"
-            ),
-        }
-    ]
-    for image in observations[:-1]:
-        content.append({"type": "image", "image": image})
-    content.extend([
-        {"type": "text", "text": " This is your current observation:"},
-        {"type": "image", "image": observations[-1]},
-        {
-            "type": "text",
-            "text": (
-                f" Your task is to {task}\n"
-                " You should take one of the following actions:\n"
-                " MOVE_FORWARD\n TURN_LEFT\n TURN_RIGHT\n STOP."
-            ),
-        },
-    ])
+    content = [{"type": "image", "image": image} for image in observations]
+    content.append({"type": "text", "text": build_vln_context(task)})
     return [[
-        {"role": "system", "content": TRAINING_SYSTEM_PROMPT},
+        {"role": "system", "content": VLN_SYSTEM_PROMPT},
         {"role": "user", "content": content},
     ]]
 
@@ -306,13 +279,6 @@ class SpatialStackVLN_Inference:
         self.device = device
         self.model_device = self.model.device
 
-        # Build inputs with the SAME preprocessing as training (vggt_load + image
-        # processor with do_rescale=False, and the training chat template) so the
-        # pixel values and prompt tokens match the fine-tuning distribution exactly.
-        self.image_processor = self.processor.image_processor
-        self.merge_size = int(getattr(self.image_processor, "merge_size", 2))
-        self._train_tokenizer = _build_training_tokenizer(self.tokenizer, "qwen3.5")
-
     def reset_geometry_cache(self):
         self.model.reset_vln_geometry_cache()
 
@@ -329,59 +295,30 @@ class SpatialStackVLN_Inference:
         return float(getattr(encoder, "last_vggt_ms", 0.0))
 
     def _build_model_inputs(self, observations, task: str) -> dict:
-        """Preprocess exactly like training (prepare_image_inputs + training chat
-        template) so eval pixel values and prompt tokens match fine-tuning."""
-        pixel_values_list, grids, geo_list = [], [], []
-        for frame in observations:
-            ret = prepare_image_inputs(
-                frame,
-                self.image_processor,
-                model_type="qwen3.5",
-                geometry_encoder_streaming=self.use_geometry_streaming,
-            )
-            pixel_values_list.append(ret["pixel_values"])
-            grids.append(ret["image_grid_thw"])
-            geo_list.append(ret["geometry_encoder_inputs"])
-
-        grid_merged = [int(g.prod()) // (self.merge_size ** 2) for g in grids]
-
-        his_img_tags = "<image>" * (len(observations) - 1)
-        content = VLN_PROMPT.format(his_img_tags=his_img_tags, instruction=task)
-
-        # Expand each <image> to vision tokens using its own merged grid size,
-        # matching preprocess_qwen_2_visual in the training pipeline.
-        parts = content.split("<image>")
-        rebuilt = []
-        for idx in range(len(parts) - 1):
-            rebuilt.append(parts[idx])
-            rebuilt.append(
-                "<|vision_start|>" + "<|image_pad|>" * grid_merged[idx] + "<|vision_end|>"
-            )
-        rebuilt.append(parts[-1])
-        content = "".join(rebuilt)
-
-        input_ids = _apply_training_chat_template(
-            self._train_tokenizer,
-            [{"role": "system", "content": TRAINING_SYSTEM_PROMPT}],
-        )
-        input_ids += _apply_training_chat_template(
-            self._train_tokenizer,
-            [{"role": "user", "content": content}],
+        """Append prompt images and text using the JanusVLN chat-message layout."""
+        messages = build_vln_messages(observations, task)
+        text = self.processor.apply_chat_template(
+            messages,
+            tokenize=False,
             add_generation_prompt=True,
+            enable_thinking=False,
         )
-        input_ids = torch.tensor([input_ids], dtype=torch.long)
-
-        model_inputs = {
-            "input_ids": input_ids,
-            "attention_mask": torch.ones_like(input_ids),
-            "pixel_values": torch.cat(pixel_values_list, dim=0),
-            "image_grid_thw": torch.stack(grids, dim=0),
-        }
+        model_inputs = self.processor(
+            text=text,
+            images=list(observations),
+            videos=None,
+            padding=True,
+            return_tensors="pt",
+        )
         if self.use_geometry:
             # Both modes encode only the CURRENT frame each step (growing KV). Broadcast
             # tiles it to all frames; frame-strict buffers it and gathers each window
             # frame's own geometry (window indices set on the model before generate).
-            model_inputs["geometry_encoder_inputs"] = [geo_list[-1].unsqueeze(0)]
+            current_geometry = build_qwen3_5_geometry_inputs(
+                [observations[-1]],
+                model_inputs["image_grid_thw"][-1:],
+            )
+            model_inputs["geometry_encoder_inputs"] = [torch.stack(current_geometry)]
             if (not getattr(self, "_geom_debug_logged", False)
                     and get_rank() == 0 and len(observations) > 1):   # skip step-0 single-frame (uninformative)
                 self._geom_debug_logged = True
@@ -816,7 +753,7 @@ def eval_main():
     parser.add_argument("--output_path", type=str, default="./evaluation/spatialstack_vln")
     parser.add_argument("--save_video", action="store_true", default=False)
     parser.add_argument("--num_history", type=int, default=8)
-    parser.add_argument("--save_video_ratio", type=float, default=0.05, help="0~1")
+    parser.add_argument("--save_video_ratio", type=float, default=1.0, help="0~1")
     parser.add_argument("--world_size", default=1, type=int)
     parser.add_argument("--rank", default=0, type=int)
     parser.add_argument("--gpu", default=0, type=int)
