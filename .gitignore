@@ -19,3 +19,6 @@ hf_cache/
 sam_hq_vit_h.pth
 evaluation/
 evaluation_*/
+!scripts/evaluation/
+scripts/evaluation/*
+!scripts/evaluation/eval_janus_vln_scene_ghost.sh

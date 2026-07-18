@@ -171,6 +171,10 @@ def train(attn_implementation="flash_attention_2"):
                 "pos_encoding_type",
                 "vision_language_fusion_layers",
                 "geometry_encoder_streaming",
+                "use_ghost_kv_cache",
+                "vggt_total_budget",
+                "vggt_importance_weights_path",
+                "vggt_budget_proportions_path",
             ]:
                 setattr(config, k, getattr(model_args, k))
 
@@ -226,6 +230,10 @@ def train(attn_implementation="flash_attention_2"):
                 "pos_encoding_type",
                 "vision_language_fusion_layers",
                 "geometry_encoder_streaming",
+                "use_ghost_kv_cache",
+                "vggt_total_budget",
+                "vggt_importance_weights_path",
+                "vggt_budget_proportions_path",
                 "geometry_fusion_scale",
                 "geometry_frame_strict",
                 "geometry_importance_gate",
@@ -306,6 +314,7 @@ def train(attn_implementation="flash_attention_2"):
     if model_args.use_geometry_encoder:
         setattr(data_args, "use_geometry_encoder", model_args.use_geometry_encoder)
         setattr(data_args, "geometry_encoder_streaming", model_args.geometry_encoder_streaming)
+        setattr(data_args, "use_ghost_kv_cache", model_args.use_ghost_kv_cache)
 
     debug_save_dir = data_args.debug_vln_save_dir or os.path.join(
         training_args.output_dir, "debug_vln"

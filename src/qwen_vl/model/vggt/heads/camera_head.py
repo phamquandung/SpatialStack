@@ -73,7 +73,13 @@ class CameraHead(nn.Module):
         self.adaln_norm = nn.LayerNorm(dim_in, elementwise_affine=False, eps=1e-6)
         self.pose_branch = Mlp(in_features=dim_in, hidden_features=dim_in // 2, out_features=self.target_dim, drop=0)
 
-    def forward(self, aggregated_tokens_list: list, num_iterations: int = 4) -> list:
+    def forward(
+        self,
+        aggregated_tokens_list: list,
+        num_iterations: int = 4,
+        past_key_values_camera=None,
+        use_cache: bool = False,
+    ) -> list:
         """
         Forward pass to predict camera parameters.
 
@@ -92,10 +98,29 @@ class CameraHead(nn.Module):
         pose_tokens = tokens[:, :, 0]
         pose_tokens = self.token_norm(pose_tokens)
 
-        pred_pose_enc_list = self.trunk_fn(pose_tokens, num_iterations)
+        if use_cache:
+            pred_pose_enc_list, past_key_values_camera = self.trunk_fn(
+                pose_tokens,
+                num_iterations,
+                past_key_values_camera,
+                use_cache,
+            )
+            return pred_pose_enc_list, past_key_values_camera
+        pred_pose_enc_list = self.trunk_fn(
+            pose_tokens,
+            num_iterations,
+            past_key_values_camera=None,
+            use_cache=use_cache,
+        )
         return pred_pose_enc_list
 
-    def trunk_fn(self, pose_tokens: torch.Tensor, num_iterations: int) -> list:
+    def trunk_fn(
+        self,
+        pose_tokens: torch.Tensor,
+        num_iterations: int,
+        past_key_values_camera,
+        use_cache: bool,
+    ) -> list:
         """
         Iteratively refine camera pose predictions.
 
@@ -126,7 +151,37 @@ class CameraHead(nn.Module):
             pose_tokens_modulated = gate_msa * modulate(self.adaln_norm(pose_tokens), shift_msa, scale_msa)
             pose_tokens_modulated = pose_tokens_modulated + pose_tokens
 
-            pose_tokens_modulated = self.trunk(pose_tokens_modulated)
+            if not use_cache:
+                L = S
+                frame_ids = torch.arange(L, device=pose_tokens_modulated.device)
+                future_frame = frame_ids.unsqueeze(1) < frame_ids.unsqueeze(0)
+                attn_mask = future_frame.to(pose_tokens_modulated.dtype) * torch.finfo(pose_tokens_modulated.dtype).min
+            else:
+                attn_mask = None
+
+            if use_cache:
+                for idx in range(self.trunk_depth):
+                    block_out = self.trunk[idx](
+                        pose_tokens_modulated,
+                        attn_mask=attn_mask,
+                        past_key_values=(
+                            past_key_values_camera[idx]
+                            if past_key_values_camera[idx] is not None
+                            else None
+                        ),
+                        use_cache=True,
+                    )
+                    if isinstance(block_out, tuple) and len(block_out) == 3:
+                        pose_tokens_modulated, block_kv, _ = block_out
+                    else:
+                        pose_tokens_modulated, block_kv = block_out
+                    past_key_values_camera[idx] = block_kv
+            else:
+                for idx in range(self.trunk_depth):
+                    pose_tokens_modulated = self.trunk[idx](
+                        pose_tokens_modulated,
+                        attn_mask=attn_mask,
+                    )
             # Compute the delta update for the pose encoding.
             pred_pose_enc_delta = self.pose_branch(self.trunk_norm(pose_tokens_modulated))
 
@@ -141,6 +196,8 @@ class CameraHead(nn.Module):
             )
             pred_pose_enc_list.append(activated_pose)
 
+        if use_cache:
+            return pred_pose_enc_list, past_key_values_camera
         return pred_pose_enc_list
 
 

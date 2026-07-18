@@ -52,5 +52,5 @@ habitat:
   dataset:
     type: R2RVLN-v1
     split: val_unseen
-    scenes_dir: /mnt/samsung/data/scene_dataset/mp3d_ce/
-    data_path: /mnt/samsung/data/datasets/R2R_VLNCE_v1-3_preprocessed/{split}/{split}.json.gz
+    scenes_dir: /media/vmo-perception/disk_2/anhdh35/JanusVLN/data/scene_datasets/
+    data_path: /media/vmo-perception/disk_2/vinhld8/JanusVLN/data/datasets/r2r/{split}/{split}.json.gz

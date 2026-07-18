@@ -24,6 +24,10 @@ class ModelArguments:
     pos_encoding_type: str = field(default="none")  # Position encoding: "none", "rope2d", or "sincos2d"
     vision_language_fusion_layers: Optional[List[int]] = field(default=None)  # Vision block indices to fuse into decoder
     geometry_encoder_streaming: bool = field(default=False)  # JanusVLN-style frame-by-frame VGGT KV cache
+    use_ghost_kv_cache: bool = field(default=False)  # Use GHOST-style VGGT KV eviction instead of start+recent trimming
+    vggt_total_budget: int = field(default=1_200_000)  # Token budget used by GHOST-style VGGT KV eviction
+    vggt_importance_weights_path: str = field(default="configs/importance_weights_default.json")
+    vggt_budget_proportions_path: str = field(default="configs/kv_budget_proportions_cosine.json")
     geometry_fusion_scale: float = field(default=1.0)  # JanusVLN-style lam on the geometry delta (saved to config)
     geometry_frame_strict: bool = field(default=False)  # Fuse each frame with its OWN geometry (vs last-frame broadcast). Env FUSION_FRAME_STRICT overrides.
     geometry_importance_gate: bool = field(default=False)  # Step 2': per-position sigmoid gate on the geometry delta (background suppression). Env FUSION_IMPORTANCE_GATE overrides.

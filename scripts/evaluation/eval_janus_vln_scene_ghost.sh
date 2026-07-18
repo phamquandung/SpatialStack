@@ -18,11 +18,14 @@ fi
 
 CHECKPOINT="${CHECKPOINT:-/media/vmo-perception/disk_2/vinhld8/checkpoints/spatialstack_janus_vln_train-gate-scale}"
 GEOMETRY_ENCODER_PATH="${GEOMETRY_ENCODER_PATH:-/media/vmo-perception/disk_2/vinhld8/checkpoints/VGGT-1B}"
-OUTPUT_PATH="${OUTPUT_PATH:-evaluation_gate_scale_fix_eval/scene}"
-SCENE_IDS="${SCENE_IDS:-EU6Fwq7SyZv}"
+SCENE_IDS="${SCENE_IDS:-a}"
+OUTPUT_PATH="${OUTPUT_PATH:-evaluation_gate_scale_fix_eval/scene_ghost/}"
 CONFIG="${CONFIG:-config/vln_r2r.yaml}"
 EVAL_SPLIT="${EVAL_SPLIT:-val_unseen}"
 SAVE_VIDEO="${SAVE_VIDEO:-1}"
+# Enable GHOST-style importance-based VGGT KV eviction.
+export USE_GHOST_KV_CACHE="${USE_GHOST_KV_CACHE:-1}"
+# The start+recent values remain available for the baseline path when GHOST is disabled.
 # VGGT streaming KV-cache window (frames of geometry history kept during eval).
 export VGGT_KV_START="${VGGT_KV_START:-8}"
 export VGGT_KV_RECENT="${VGGT_KV_RECENT:-56}"
@@ -32,12 +35,12 @@ export VLN_ORACLE_STOP="${VLN_ORACLE_STOP:-0}"
 export GEOMETRY_ENCODER_PATH
 
 echo "CHECKPOINT: ${CHECKPOINT}"
-echo "GEOMETRY_ENCODER_PATH: ${GEOMETRY_ENCODER_PATH}"
+echo "SCENE_IDS: ${SCENE_IDS}"
 echo "OUTPUT_PATH: ${OUTPUT_PATH}"
 echo "CONFIG: ${CONFIG}"
 echo "EVAL_SPLIT: ${EVAL_SPLIT}"
 echo "NPROC_PER_NODE: ${NPROC_PER_NODE}"
-echo "SAVE_VIDEO: ${SAVE_VIDEO}"
+echo "USE_GHOST_KV_CACHE: ${USE_GHOST_KV_CACHE}"
 echo "VGGT_KV: start=${VGGT_KV_START} recent=${VGGT_KV_RECENT}"
 echo "VLN_ORACLE_STOP: ${VLN_ORACLE_STOP}"
 
@@ -48,7 +51,7 @@ if [ "${SAVE_VIDEO}" = "1" ]; then
   extra_args+=(--save_video)
 fi
 
-torchrun --nproc_per_node="${NPROC_PER_NODE}" --master_port="${MASTER_PORT}" src/evaluation.py \
+torchrun --nproc_per_node="${NPROC_PER_NODE}" --master_port="${MASTER_PORT}" src/evaluation_scene.py \
   --model_path "${CHECKPOINT}" \
   --geometry_encoder_path "${GEOMETRY_ENCODER_PATH}" \
   --habitat_config_path "${CONFIG}" \

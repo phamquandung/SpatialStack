@@ -15,10 +15,14 @@ class GeometryEncoderConfig:
     reference_frame: str = "first"  # "first" or "last"
     feature_dim: int = 2048  # Will be overridden by encoder's get_feature_dim()
     freeze_encoder: bool = True
+    use_ghost_kv_cache: bool = False
+    vggt_total_budget: int = 1_200_000
+    vggt_importance_weights_path: str = "configs/importance_weights_default.json"
+    vggt_budget_proportions_path: str = "configs/kv_budget_proportions_cosine.json"
     
     # Encoder-specific configs
     encoder_kwargs: Dict[str, Any] = None
-    
+
     def __post_init__(self):
         if self.encoder_kwargs is None:
             self.encoder_kwargs = {}

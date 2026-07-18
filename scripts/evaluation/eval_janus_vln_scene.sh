@@ -16,13 +16,13 @@ if [ "${NPROC_PER_NODE}" -lt 1 ]; then
   NPROC_PER_NODE=1
 fi
 
-CHECKPOINT="${CHECKPOINT:-/mnt/samsung/Project/CoRL-ICRA/SpatialStack/model-checkpoint/spatialstack_vln_fix_0.5_full}"
-GEOMETRY_ENCODER_PATH="${GEOMETRY_ENCODER_PATH:-/mnt/samsung/Project/CoRL-ICRA/SpatialStack/model-checkpoint/VGGT-1B}"
+CHECKPOINT="${CHECKPOINT:-/media/vmo-perception/disk_2/vinhld8/checkpoints/spatialstack_janus_vln_train-gate-scale}"
+GEOMETRY_ENCODER_PATH="${GEOMETRY_ENCODER_PATH:-/media/vmo-perception/disk_2/vinhld8/checkpoints/VGGT-1B}"
 SCENE_IDS="${SCENE_IDS:-EU6Fwq7SyZv}"
-OUTPUT_PATH="${OUTPUT_PATH:-evaluation/scene/${SCENE_IDS}}"
+OUTPUT_PATH="${OUTPUT_PATH:-evaluation_gate_scale_fix_eval/scene/${SCENE_IDS}}"
 CONFIG="${CONFIG:-config/vln_r2r.yaml}"
 EVAL_SPLIT="${EVAL_SPLIT:-val_unseen}"
-SAVE_VIDEO="${SAVE_VIDEO:-0}"
+SAVE_VIDEO="${SAVE_VIDEO:-1}"
 # VGGT streaming KV-cache window (frames of geometry history kept during eval).
 export VGGT_KV_START="${VGGT_KV_START:-8}"
 export VGGT_KV_RECENT="${VGGT_KV_RECENT:-56}"

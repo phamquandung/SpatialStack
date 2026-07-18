@@ -1836,7 +1836,19 @@ class Qwen2_5_VLForConditionalGenerationWithVGGT(Qwen2_5_VLPreTrainedModel, Gene
             encoder_type=getattr(config, "geometry_encoder_type", "vggt"),
             model_path=getattr(config, "geometry_encoder_path", None),
             reference_frame=getattr(config, "reference_frame", "first"),
-            freeze_encoder=getattr(config, "geometry_encoder_freeze", True)
+            freeze_encoder=getattr(config, "geometry_encoder_freeze", True),
+            use_ghost_kv_cache=getattr(config, "use_ghost_kv_cache", False),
+            vggt_total_budget=getattr(config, "vggt_total_budget", 1_200_000),
+            vggt_importance_weights_path=getattr(
+                config,
+                "vggt_importance_weights_path",
+                "configs/importance_weights_default.json",
+            ),
+            vggt_budget_proportions_path=getattr(
+                config,
+                "vggt_budget_proportions_path",
+                "configs/kv_budget_proportions_cosine.json",
+            ),
         )
         
         # Create geometry encoder
@@ -1845,6 +1857,10 @@ class Qwen2_5_VLForConditionalGenerationWithVGGT(Qwen2_5_VLPreTrainedModel, Gene
             model_path=encoder_config.model_path,
             reference_frame=encoder_config.reference_frame,
             freeze_encoder=encoder_config.freeze_encoder,
+            use_ghost_kv_cache=encoder_config.use_ghost_kv_cache,
+            vggt_total_budget=encoder_config.vggt_total_budget,
+            vggt_importance_weights_path=encoder_config.vggt_importance_weights_path,
+            vggt_budget_proportions_path=encoder_config.vggt_budget_proportions_path,
         )
         
         if "deepstack" in getattr(config, "feature_fusion_method", "add"):

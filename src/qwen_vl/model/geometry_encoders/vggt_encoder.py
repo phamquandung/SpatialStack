@@ -1,5 +1,7 @@
 """VGGT geometry encoder implementation."""
 
+import json
+import os
 import torch
 import torch.nn as nn
 from typing import Optional, List
@@ -74,8 +76,12 @@ class VGGTEncoder(BaseGeometryEncoder):
         self.patch_size = 14
         self._vggt_pretrained_path = config.model_path
         self._depth_head_ready = False
+        self._ghost_heads_ready = False
         self._eval_streaming = False
         self._streaming_past_key_values = None
+        self._streaming_past_key_values_camera = None
+        self._streaming_importance_cache = None
+        self._streaming_frame_metadata = None
         self._streaming_frame_idx = 0
         self.last_vggt_ms = 0.0
         # Incremental frame-strict eval: buffer each frame's geometry (computed with the
@@ -86,10 +92,23 @@ class VGGTEncoder(BaseGeometryEncoder):
         # Eval-time VGGT KV-cache window (in frames). Defaults match JanusVLN (8+48=56).
         # Override via env to test the long-horizon geometry-drift hypothesis, e.g.
         # VGGT_KV_START=1 VGGT_KV_RECENT=8 caps the cache at 9 frames (training horizon).
-        import os as _os
-        _kv_start = int(_os.environ.get("VGGT_KV_START", "8"))
-        _kv_recent = int(_os.environ.get("VGGT_KV_RECENT", "48"))
+        _ghost_env = os.environ.get("USE_GHOST_KV_CACHE")
+        self.use_ghost_kv_cache = (
+            _ghost_env.lower() in ("1", "true", "yes")
+            if _ghost_env is not None
+            else bool(config.use_ghost_kv_cache)
+        )
+        self.vggt_total_budget = int(config.vggt_total_budget)
+        self.vggt_importance_weights_path = config.vggt_importance_weights_path
+        self.vggt_budget_proportions_path = config.vggt_budget_proportions_path
+        self.vggt_importance_weights = None
+        self._vggt_configs_loaded = False
+        print(f"[VGGTEncoder] use_ghost_kv_cache={self.use_ghost_kv_cache}")
+        _kv_start = int(os.environ.get("VGGT_KV_START", "8"))
+        _kv_recent = int(os.environ.get("VGGT_KV_RECENT", "48"))
         print(f"[VGGTEncoder] eval KV-cache window: start={_kv_start} recent={_kv_recent} (total={_kv_start + _kv_recent} frames)")
+        if self.use_ghost_kv_cache:
+            print(f"[VGGTEncoder] GHOST KV-cache enabled: total_budget={self.vggt_total_budget}")
         self._kv_cache_trim = StartRecentKVCache(start_size=_kv_start, recent_size=_kv_recent, k_seq_dim=2, v_seq_dim=2)
 
     def set_eval_streaming(self, enabled: bool) -> None:
@@ -108,10 +127,50 @@ class VGGTEncoder(BaseGeometryEncoder):
 
     def reset_streaming_cache(self) -> None:
         self._streaming_past_key_values = None
+        self._streaming_past_key_values_camera = None
+        self._streaming_importance_cache = None
+        self._streaming_frame_metadata = None
         self._streaming_frame_idx = 0
         self.last_vggt_ms = 0.0
         self._frame_feature_buffer = [] if self._eval_frame_strict else None
         self._eval_window_indices = None
+        self._reset_vggt_attention_cache_state()
+
+    def _reset_vggt_attention_cache_state(self) -> None:
+        for block in self.vggt.aggregator.global_blocks:
+            if hasattr(block.attn, "_reset_cache_state"):
+                block.attn._reset_cache_state()
+
+    @staticmethod
+    def _resolve_config_path(path: Optional[str]) -> Optional[str]:
+        if not path:
+            return None
+        if os.path.isabs(path) and os.path.isfile(path):
+            return path
+        repo_root = os.path.dirname(
+            os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(__file__))))
+        )
+        for candidate in (path, os.path.join(os.getcwd(), path), os.path.join(repo_root, path)):
+            candidate = os.path.normpath(candidate)
+            if os.path.isfile(candidate):
+                return candidate
+        return None
+
+    def _load_vggt_configs(self) -> None:
+        if self._vggt_configs_loaded:
+            return
+        weights_path = self._resolve_config_path(self.vggt_importance_weights_path)
+        if weights_path is not None:
+            with open(weights_path) as f:
+                self.vggt_importance_weights = json.load(f)
+        proportions_path = self._resolve_config_path(self.vggt_budget_proportions_path)
+        if proportions_path is not None:
+            with open(proportions_path) as f:
+                cfg = json.load(f)
+            self.vggt.aggregator.budget_proportions = torch.tensor(
+                cfg["proportions"], dtype=torch.float32
+            )
+        self._vggt_configs_loaded = True
         
     
     def encode(self, images: torch.Tensor) -> torch.Tensor:
@@ -407,6 +466,20 @@ class VGGTEncoder(BaseGeometryEncoder):
 
         if self._streaming_past_key_values is None:
             self._streaming_past_key_values = [None] * self.vggt.aggregator.depth
+            self._streaming_past_key_values_camera = None
+            self._streaming_importance_cache = {}
+            self._streaming_frame_metadata = []
+            self._reset_vggt_attention_cache_state()
+        elif self._streaming_importance_cache is None:
+            self._streaming_importance_cache = {}
+        if self._streaming_frame_metadata is None:
+            self._streaming_frame_metadata = []
+
+        if self.use_ghost_kv_cache:
+            self._load_vggt_configs()
+            self._ensure_ghost_heads()
+            if self._streaming_past_key_values_camera is None:
+                self._streaming_past_key_values_camera = [None] * self.vggt.camera_head.trunk_depth
 
         dtype = torch.bfloat16 if torch.cuda.get_device_capability()[0] >= 8 else torch.float16
         frame_input = frame.unsqueeze(0).unsqueeze(0)
@@ -422,10 +495,23 @@ class VGGTEncoder(BaseGeometryEncoder):
                     frame_input,
                     past_key_values=self._streaming_past_key_values,
                     use_cache=True,
-                    past_frame_idx=0,
+                    past_frame_idx=self._streaming_frame_idx,
+                    total_budget=self.vggt_total_budget if self.use_ghost_kv_cache else 0,
+                    eviction_mode="importance" if self.use_ghost_kv_cache else "",
+                    frame_metadata=self._streaming_frame_metadata if self.use_ghost_kv_cache else None,
+                    importance_cache=self._streaming_importance_cache if self.use_ghost_kv_cache else None,
+                    importance_weights=self.vggt_importance_weights if self.use_ghost_kv_cache else None,
                 )
                 aggregated_tokens_list, patch_start_idx, self._streaming_past_key_values = output
-                self._streaming_past_key_values = self._kv_cache_trim(self._streaming_past_key_values)
+                if self.use_ghost_kv_cache:
+                    self._append_ghost_frame_metadata(
+                        aggregated_tokens_list,
+                        frame_input,
+                        patch_start_idx,
+                    )
+                else:
+                    self._streaming_past_key_values = self._kv_cache_trim(self._streaming_past_key_values)
+                self._streaming_frame_idx += 1
 
                 if torch.cuda.is_available():
                     vggt_end.record()
@@ -536,11 +622,79 @@ class VGGTEncoder(BaseGeometryEncoder):
         from ..vggt.models.vggt import VGGT
         self._vggt_pretrained_path = model_path
         self.vggt = VGGT.from_pretrained(model_path, enable_camera=False, enable_point=False, enable_depth=False, enable_track=False)
+        self._depth_head_ready = False
+        self._ghost_heads_ready = False
                 
         # Freeze parameters if required
         if self.freeze_encoder:
             for param in self.vggt.parameters():
                 param.requires_grad = False
+
+    def _ensure_ghost_heads(self) -> None:
+        if self._ghost_heads_ready:
+            return
+        if (
+            self.vggt.camera_head is not None
+            and self.vggt.depth_head is not None
+            and self.vggt.point_head is not None
+        ):
+            self._ghost_heads_ready = True
+            self._depth_head_ready = True
+            return
+
+        from ..vggt.models.vggt import VGGT
+
+        path = self._vggt_pretrained_path or "facebook/VGGT-1B"
+        tmp = VGGT.from_pretrained(
+            path,
+            enable_camera=True,
+            enable_point=True,
+            enable_depth=True,
+            enable_track=False,
+        )
+        device = next(self.vggt.parameters()).device
+        self.vggt.camera_head = tmp.camera_head.to(device)
+        self.vggt.depth_head = tmp.depth_head.to(device)
+        self.vggt.point_head = tmp.point_head.to(device)
+        for head in (self.vggt.camera_head, self.vggt.depth_head, self.vggt.point_head):
+            head.eval()
+            for param in head.parameters():
+                param.requires_grad = False
+        del tmp
+        self._ghost_heads_ready = True
+        self._depth_head_ready = True
+
+    def _append_ghost_frame_metadata(
+        self,
+        aggregated_tokens_list: List[torch.Tensor],
+        images: torch.Tensor,
+        patch_start_idx: int,
+    ) -> None:
+        pose_enc, self._streaming_past_key_values_camera = self.vggt.camera_head(
+            aggregated_tokens_list,
+            past_key_values_camera=self._streaming_past_key_values_camera,
+            use_cache=True,
+        )
+        camera_pose = pose_enc[-1][:, 0, :]
+
+        depth, depth_conf = self.vggt.depth_head(
+            aggregated_tokens_list,
+            images=images,
+            patch_start_idx=patch_start_idx,
+        )
+        _pts3d, pts3d_conf = self.vggt.point_head(
+            aggregated_tokens_list,
+            images=images,
+            patch_start_idx=patch_start_idx,
+        )
+        self._streaming_frame_metadata.append(
+            {
+                "camera_pose": camera_pose.detach().cpu(),
+                "depth": depth[:, 0].detach().cpu(),
+                "depth_conf": depth_conf[:, 0].detach().cpu(),
+                "conf": pts3d_conf[:, 0].detach().cpu(),
+            }
+        )
 
     def _ensure_depth_head(self) -> None:
         if self._depth_head_ready:

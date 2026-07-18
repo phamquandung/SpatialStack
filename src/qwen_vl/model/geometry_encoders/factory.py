@@ -11,6 +11,10 @@ def create_geometry_encoder(
     model_path: Optional[str] = None,
     reference_frame: str = "first",
     freeze_encoder: bool = True,
+    use_ghost_kv_cache: bool = False,
+    vggt_total_budget: int = 1_200_000,
+    vggt_importance_weights_path: str = "configs/importance_weights_default.json",
+    vggt_budget_proportions_path: str = "configs/kv_budget_proportions_cosine.json",
     **encoder_kwargs
 ) -> BaseGeometryEncoder:
     """
@@ -31,6 +35,10 @@ def create_geometry_encoder(
         model_path=model_path,
         reference_frame=reference_frame,
         freeze_encoder=freeze_encoder,
+        use_ghost_kv_cache=use_ghost_kv_cache,
+        vggt_total_budget=vggt_total_budget,
+        vggt_importance_weights_path=vggt_importance_weights_path,
+        vggt_budget_proportions_path=vggt_budget_proportions_path,
         encoder_kwargs=encoder_kwargs
     )
     

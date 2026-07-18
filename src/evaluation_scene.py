@@ -18,12 +18,12 @@ def eval_scene():
         "--scene_ids",
         type=str,
         required=True,
-        help="Comma-separated MP3D scene ids (e.g. EU6Fwq7SyZv).",
+        help="Comma-separated MP3D scene ids to skip (e.g. EU6Fwq7SyZv).",
     )
     parser.add_argument("--output_path", type=str, default="./evaluation/scene")
     parser.add_argument("--save_video", action="store_true", default=False)
     parser.add_argument("--num_history", type=int, default=8)
-    parser.add_argument("--save_video_ratio", type=float, default=0.05, help="0~1")
+    parser.add_argument("--save_video_ratio", type=float, default=1.0, help="0~1")
     parser.add_argument("--world_size", default=1, type=int)
     parser.add_argument("--rank", default=0, type=int)
     parser.add_argument("--gpu", default=0, type=int)
@@ -36,7 +36,7 @@ def eval_scene():
     args = parser.parse_args()
     scene_filter = parse_scene_ids(args.scene_ids)
     if not scene_filter:
-        raise ValueError("--scene_ids must contain at least one scene id")
+        raise ValueError("--scene_ids must contain at least one scene id to skip")
 
     set_seed(args.seed)
     init_distributed_mode(args)

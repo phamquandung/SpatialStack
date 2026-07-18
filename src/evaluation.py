@@ -418,8 +418,6 @@ class VLNEvaluator:
 
         with habitat.config.read_write(self.config):
             self.config.habitat.dataset.split = self.split
-            if self.scene_filter is not None:
-                self.config.habitat.dataset.content_scenes = sorted(self.scene_filter)
             if torch.cuda.is_available():
                 gpu_id = getattr(args, "local_rank", getattr(args, "gpu", 0))
                 self.config.habitat.simulator.habitat_sim_v0.gpu_device_id = gpu_id
@@ -437,6 +435,9 @@ class VLNEvaluator:
                     fog_of_war=FogOfWarConfig(draw=True, visibility_dist=5.0, fov=90),
                 )
             self.config.habitat.task.measurements.update(measurements)
+
+        if self.scene_filter and get_rank() == 0:
+            print(f"[eval] skipping scenes: {sorted(self.scene_filter)}", flush=True)
 
         self.model = model
         self.actions2idx = OrderedDict({
@@ -479,10 +480,9 @@ class VLNEvaluator:
             config=self.config.habitat.dataset,
         )
         if len(dataset.episodes) == 0:
-            scenes = sorted(self.scene_filter) if self.scene_filter else ["*"]
             raise ValueError(
-                f"No episodes found for split={self.split!r} and scenes={scenes}. "
-                "Check that each scene id appears in the chosen eval split."
+                f"No episodes found for split={self.split!r}. "
+                "Check the dataset path and configured content_scenes."
             )
         return Env(config=self.config)
 
@@ -503,7 +503,7 @@ class VLNEvaluator:
                     res = json.loads(line)
                     if "sucs_all" in res:
                         continue
-                    if self.scene_filter is not None and res["scene_id"] not in self.scene_filter:
+                    if self.scene_filter is not None and res["scene_id"] in self.scene_filter:
                         continue
                     done_res.append([res["scene_id"], res["episode_id"], res["episode_instruction"]])
                     if get_rank() == 0:
@@ -515,7 +515,7 @@ class VLNEvaluator:
         for scene in sorted(scene_episode_dict.keys()):
             episodes = scene_episode_dict[scene]
             scene_id = scene.split("/")[-2]
-            if self.scene_filter is not None and scene_id not in self.scene_filter:
+            if self.scene_filter is not None and scene_id in self.scene_filter:
                 continue
             print(f"scene_id = {scene_id}")
 
@@ -753,7 +753,7 @@ def eval_main():
     parser.add_argument("--output_path", type=str, default="./evaluation/spatialstack_vln")
     parser.add_argument("--save_video", action="store_true", default=False)
     parser.add_argument("--num_history", type=int, default=8)
-    parser.add_argument("--save_video_ratio", type=float, default=1.0, help="0~1")
+    parser.add_argument("--save_video_ratio", type=float, default=0.2, help="0~1")
     parser.add_argument("--world_size", default=1, type=int)
     parser.add_argument("--rank", default=0, type=int)
     parser.add_argument("--gpu", default=0, type=int)
@@ -762,7 +762,21 @@ def eval_main():
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--max_steps", default=400, type=int)
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument(
+        "--scene_ids",
+        type=str,
+        required=True,
+        help="Comma-separated MP3D scene ids to skip (e.g. EU6Fwq7SyZv).",
+    )
     args = parser.parse_args()
+
+    scene_filter = {
+        scene_id.strip()
+        for scene_id in args.scene_ids.split(",")
+        if scene_id.strip()
+    }
+    if not scene_filter:
+        raise ValueError("--scene_ids must contain at least one scene id to skip")
 
     set_seed(args.seed)
     init_distributed_mode(args)
@@ -773,7 +787,7 @@ def eval_main():
         device=f"cuda:{args.local_rank}",
         geometry_encoder_path=geometry_encoder_path or None,
     )
-    evaluate(model, args)
+    evaluate(model, args, scene_filter=scene_filter)
 
 
 if __name__ == "__main__":
