@@ -22,3 +22,4 @@ evaluation_*/
 !scripts/evaluation/
 scripts/evaluation/*
 !scripts/evaluation/eval_janus_vln_scene_ghost.sh
+!scripts/evaluation/eval_janus_vln_scene_segment_transition_ghost.sh

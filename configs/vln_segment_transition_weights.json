@@ -1,0 +1,21 @@
+{
+  "score_mode": "vln_segment_transition",
+  "score_weights": {
+    "geometry": 0.30,
+    "confidence": 0.20,
+    "instruction": 0.30,
+    "transition": 0.20
+  },
+  "geometry_weights": {
+    "camera_pose_change": 0.50,
+    "depth_structure": 0.50
+  },
+  "confidence": {
+    "merge": "min"
+  },
+  "transition": {
+    "recent_window_size": 4,
+    "confidence_gate_weight": 0.50,
+    "instruction_gate_weight": 0.50
+  }
+}

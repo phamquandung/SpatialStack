@@ -282,6 +282,10 @@ class SpatialStackVLN_Inference:
     def reset_geometry_cache(self):
         self.model.reset_vln_geometry_cache()
 
+    def initialize_segment_transition_instruction(self, instruction: str):
+        """Initialize optional per-episode instruction metadata (a no-op otherwise)."""
+        self.model.initialize_vln_segment_instruction(instruction, self.tokenizer)
+
     def _geometry_kv_cache(self):
         encoder = getattr(self.model.model, "geometry_encoder", None)
         if encoder is None:
@@ -546,6 +550,7 @@ class VLNEvaluator:
 
                 rgb_list = []
                 self.model.reset_geometry_cache()
+                self.model.initialize_segment_transition_instruction(episode_instruction)
                 reset_peak_memory_stats(self.device)
                 ep_peak_alloc = 0.0
                 ep_peak_reserved = 0.0

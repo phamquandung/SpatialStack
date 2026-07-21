@@ -28,6 +28,7 @@ class ModelArguments:
     vggt_total_budget: int = field(default=1_200_000)  # Token budget used by GHOST-style VGGT KV eviction
     vggt_importance_weights_path: str = field(default="configs/importance_weights_default.json")
     vggt_budget_proportions_path: str = field(default="configs/kv_budget_proportions_cosine.json")
+    vln_segment_transition_weights_path: str = field(default="configs/vln_segment_transition_weights.json")
     geometry_fusion_scale: float = field(default=1.0)  # JanusVLN-style lam on the geometry delta (saved to config)
     geometry_frame_strict: bool = field(default=False)  # Fuse each frame with its OWN geometry (vs last-frame broadcast). Env FUSION_FRAME_STRICT overrides.
     geometry_importance_gate: bool = field(default=False)  # Step 2': per-position sigmoid gate on the geometry delta (background suppression). Env FUSION_IMPORTANCE_GATE overrides.

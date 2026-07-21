@@ -19,6 +19,7 @@ class GeometryEncoderConfig:
     vggt_total_budget: int = 1_200_000
     vggt_importance_weights_path: str = "configs/importance_weights_default.json"
     vggt_budget_proportions_path: str = "configs/kv_budget_proportions_cosine.json"
+    vln_segment_transition_weights_path: str = "configs/vln_segment_transition_weights.json"
     
     # Encoder-specific configs
     encoder_kwargs: Dict[str, Any] = None

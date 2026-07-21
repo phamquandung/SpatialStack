@@ -175,6 +175,7 @@ def train(attn_implementation="flash_attention_2"):
                 "vggt_total_budget",
                 "vggt_importance_weights_path",
                 "vggt_budget_proportions_path",
+                "vln_segment_transition_weights_path",
             ]:
                 setattr(config, k, getattr(model_args, k))
 
@@ -234,6 +235,7 @@ def train(attn_implementation="flash_attention_2"):
                 "vggt_total_budget",
                 "vggt_importance_weights_path",
                 "vggt_budget_proportions_path",
+                "vln_segment_transition_weights_path",
                 "geometry_fusion_scale",
                 "geometry_frame_strict",
                 "geometry_importance_gate",

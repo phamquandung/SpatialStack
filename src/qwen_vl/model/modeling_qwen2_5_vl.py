@@ -1849,6 +1849,11 @@ class Qwen2_5_VLForConditionalGenerationWithVGGT(Qwen2_5_VLPreTrainedModel, Gene
                 "vggt_budget_proportions_path",
                 "configs/kv_budget_proportions_cosine.json",
             ),
+            vln_segment_transition_weights_path=getattr(
+                config,
+                "vln_segment_transition_weights_path",
+                "configs/vln_segment_transition_weights.json",
+            ),
         )
         
         # Create geometry encoder
@@ -1861,6 +1866,7 @@ class Qwen2_5_VLForConditionalGenerationWithVGGT(Qwen2_5_VLPreTrainedModel, Gene
             vggt_total_budget=encoder_config.vggt_total_budget,
             vggt_importance_weights_path=encoder_config.vggt_importance_weights_path,
             vggt_budget_proportions_path=encoder_config.vggt_budget_proportions_path,
+            vln_segment_transition_weights_path=encoder_config.vln_segment_transition_weights_path,
         )
         
         if "deepstack" in getattr(config, "feature_fusion_method", "add"):

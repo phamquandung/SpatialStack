@@ -525,6 +525,11 @@ class Qwen3_5ModelWithGeometry(Qwen3_5Model):
                 "vggt_budget_proportions_path",
                 "configs/kv_budget_proportions_cosine.json",
             ),
+            vln_segment_transition_weights_path=getattr(
+                config,
+                "vln_segment_transition_weights_path",
+                "configs/vln_segment_transition_weights.json",
+            ),
         )
 
         self.geometry_encoder = create_geometry_encoder(
@@ -536,6 +541,7 @@ class Qwen3_5ModelWithGeometry(Qwen3_5Model):
             vggt_total_budget=encoder_config.vggt_total_budget,
             vggt_importance_weights_path=encoder_config.vggt_importance_weights_path,
             vggt_budget_proportions_path=encoder_config.vggt_budget_proportions_path,
+            vln_segment_transition_weights_path=encoder_config.vln_segment_transition_weights_path,
         )
 
         if fusion_method in ("deepstack_language_add", "deepstack_language_sgf"):
@@ -688,6 +694,9 @@ class Qwen3_5ModelWithGeometry(Qwen3_5Model):
         # that change only DOWNSTREAM settings (fusion layers, stop weight, lr...).
         # Enable with env GEOMETRY_FEATURE_CACHE_DIR=/path/to/cache.
         cache_dir = os.environ.get("GEOMETRY_FEATURE_CACHE_DIR")
+        if getattr(self.geometry_encoder, "use_vln_segment_transition", False):
+            # This mode must execute the streaming encoder to append and score new KV.
+            cache_dir = None
         cache_path = None
         if cache_dir:
             import hashlib
@@ -719,6 +728,8 @@ class Qwen3_5ModelWithGeometry(Qwen3_5Model):
             if cache_path is not None:
                 torch.save([t.detach().to(torch.float16).cpu() for t in layer_features], cache_path)
 
+        self._finalize_vln_segment_cache(layer_features)
+
         if os.environ.get("FUSION_DEBUG_SHAPES") and not getattr(self, "_fusion_shape_logged", False):
             _shp = tuple(layer_features[0].shape) if layer_features else None
             _n_out = _shp[0] if _shp else 0   # frames of geometry actually returned to fusion
@@ -737,6 +748,45 @@ class Qwen3_5ModelWithGeometry(Qwen3_5Model):
             geometry_layer_features.setdefault(layer_idx, []).append(layer_feature)
 
         return geometry_layer_features
+
+    @torch.no_grad()
+    def _finalize_vln_segment_cache(self, layer_features) -> None:
+        """Project current geometry with the trained fusion projector, then prune KV."""
+        encoder = self.geometry_encoder
+        if not getattr(encoder, "use_vln_segment_transition", False):
+            return
+        if not layer_features:
+            raise RuntimeError("vln_segment_transition received no geometry features")
+        feature = layer_features[0][-1:]
+        fusion = self.language_feature_fusion
+        if fusion is None:
+            raise RuntimeError("vln_segment_transition requires the existing language fusion projector")
+        decoder_layer = int(getattr(self.config, "geometry_fusion_layers")[0])
+        projector = fusion.get_fusion_layer(decoder_layer)[0]
+        method = fusion.config.fusion_method
+        if method in ("deepstack_language_add", "deepstack_language_cross_attn", "deepstack_language_sgf"):
+            merge_area = fusion.config.spatial_merge_size ** 2
+            if feature.shape[1] % merge_area == 1:
+                # Camera is a special token; it receives privilege later and must not
+                # participate in instruction relevance or transition descriptors.
+                feature = feature[:, 1:]
+            projected = projector["geo_ln"](feature)
+            projected = projected.reshape(
+                -1,
+                fusion.geo_hidden_size * fusion.config.spatial_merge_size ** 2,
+            )
+            projected = projector["geo_mlp"](projected)
+        else:
+            raise RuntimeError(
+                "vln_segment_transition currently requires a deepstack_language_* "
+                f"fusion checkpoint, found {method!r}"
+            )
+        patch_h, patch_w = encoder._streaming_patch_hw
+        merge = int(fusion.config.spatial_merge_size)
+        encoder.finalize_vln_segment_transition(
+            projected,
+            aligned_grid_hw=(patch_h // merge, patch_w // merge),
+        )
 
     def _collect_vision_layer_features(self, vision_hidden_states, image_grid_thw):
         fusion_layers = getattr(self.config, "geometry_fusion_layers", None)
@@ -945,6 +995,20 @@ class Qwen3_5ForConditionalGenerationWithGeometry(Qwen3_5ForConditionalGeneratio
         encoder = getattr(self.model, "geometry_encoder", None)
         if encoder is not None and hasattr(encoder, "reset_streaming_cache"):
             encoder.reset_streaming_cache()
+
+    @torch.no_grad()
+    def initialize_vln_segment_instruction(self, instruction: str, tokenizer) -> None:
+        """Build and install the episode's frozen instruction-segment state."""
+        encoder = getattr(self.model, "geometry_encoder", None)
+        if not getattr(encoder, "use_vln_segment_transition", False):
+            return
+        from .vggt.eviction.vln_segment_transition import build_instruction_segment_state
+
+        embedding = self.model.get_input_embeddings()
+        state = build_instruction_segment_state(
+            instruction, tokenizer, embedding, embedding.weight.device
+        )
+        encoder.set_vln_instruction_state(state)
 
     def enable_vln_eval_streaming(self) -> None:
         encoder = getattr(self.model, "geometry_encoder", None)

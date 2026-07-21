@@ -1,9 +1,11 @@
 """VGGT geometry encoder implementation."""
 
 import json
+import math
 import os
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from typing import Optional, List
 
 from .base import BaseGeometryEncoder, GeometryEncoderConfig
@@ -83,6 +85,7 @@ class VGGTEncoder(BaseGeometryEncoder):
         self._streaming_importance_cache = None
         self._streaming_frame_metadata = None
         self._streaming_frame_idx = 0
+        self._streaming_patch_hw = None
         self.last_vggt_ms = 0.0
         # Incremental frame-strict eval: buffer each frame's geometry (computed with the
         # growing KV) and return the requested window per-frame, instead of broadcasting.
@@ -98,17 +101,38 @@ class VGGTEncoder(BaseGeometryEncoder):
             if _ghost_env is not None
             else bool(config.use_ghost_kv_cache)
         )
+        self.ghost_score_mode = os.environ.get("GHOST_SCORE_MODE", "importance").strip().lower()
+        if self.ghost_score_mode not in ("importance", "vln_segment_transition"):
+            raise ValueError(
+                "GHOST_SCORE_MODE must be 'importance' or 'vln_segment_transition', got "
+                f"{self.ghost_score_mode!r}"
+            )
+        self.use_vln_segment_transition = (
+            self.use_ghost_kv_cache and self.ghost_score_mode == "vln_segment_transition"
+        )
+        self._vln_instruction_state = None
+        self._vln_transition_state = None
+        self._vln_metadata_per_layer = None
+        self._vln_layer_budgets = None
         self.vggt_total_budget = int(config.vggt_total_budget)
         self.vggt_importance_weights_path = config.vggt_importance_weights_path
         self.vggt_budget_proportions_path = config.vggt_budget_proportions_path
+        self.vln_segment_transition_weights_path = os.environ.get(
+            "VLN_SEGMENT_TRANSITION_WEIGHTS_PATH",
+            config.vln_segment_transition_weights_path,
+        )
         self.vggt_importance_weights = None
+        self.vln_segment_transition_weights = None
         self._vggt_configs_loaded = False
         print(f"[VGGTEncoder] use_ghost_kv_cache={self.use_ghost_kv_cache}")
         _kv_start = int(os.environ.get("VGGT_KV_START", "8"))
         _kv_recent = int(os.environ.get("VGGT_KV_RECENT", "48"))
         print(f"[VGGTEncoder] eval KV-cache window: start={_kv_start} recent={_kv_recent} (total={_kv_start + _kv_recent} frames)")
         if self.use_ghost_kv_cache:
-            print(f"[VGGTEncoder] GHOST KV-cache enabled: total_budget={self.vggt_total_budget}")
+            print(
+                f"[VGGTEncoder] GHOST KV-cache enabled: total_budget={self.vggt_total_budget} "
+                f"score_mode={self.ghost_score_mode}"
+            )
         self._kv_cache_trim = StartRecentKVCache(start_size=_kv_start, recent_size=_kv_recent, k_seq_dim=2, v_seq_dim=2)
 
     def set_eval_streaming(self, enabled: bool) -> None:
@@ -131,10 +155,233 @@ class VGGTEncoder(BaseGeometryEncoder):
         self._streaming_importance_cache = None
         self._streaming_frame_metadata = None
         self._streaming_frame_idx = 0
+        self._vln_metadata_per_layer = None
+        if self._vln_transition_state is not None:
+            self._vln_transition_state.reset()
         self.last_vggt_ms = 0.0
         self._frame_feature_buffer = [] if self._eval_frame_strict else None
         self._eval_window_indices = None
         self._reset_vggt_attention_cache_state()
+
+    def set_vln_instruction_state(self, state) -> None:
+        """Install immutable per-episode text metadata for the opt-in VLN scorer."""
+        if not self.use_vln_segment_transition:
+            return
+        from ..vggt.eviction.vln_segment_transition import RecentTransitionState
+
+        self._load_vggt_configs()
+        transition_cfg = self.vln_segment_transition_weights["transition"]
+        self._vln_instruction_state = state
+        self._vln_transition_state = RecentTransitionState(
+            max_frames=int(transition_cfg["recent_window_size"])
+        )
+        self._vln_metadata_per_layer = None
+        # Resolve fixed offline-profiled budgets once during episode initialization,
+        # outside the per-frame scorer (which stays GPU-only and synchronization-free).
+        self._vln_layer_budgets = self.vggt.aggregator._calculate_dynamic_budgets(
+            self.vggt_total_budget
+        ).detach().cpu().tolist()
+        print(
+            "[VGGTEncoder] initialized vln_segment_transition: "
+            f"segments={state.segment_embeddings.shape[0]} "
+            f"recent_window={transition_cfg['recent_window_size']} "
+            f"layer_budgets=[{min(self._vln_layer_budgets)}, {max(self._vln_layer_budgets)}]"
+        )
+
+    @torch.no_grad()
+    def finalize_vln_segment_transition(
+        self,
+        aligned_visual_tokens: torch.Tensor,
+        aligned_grid_hw=None,
+    ) -> None:
+        """Score the just-appended frame and globally prune every VGGT layer cache."""
+        if not self.use_vln_segment_transition:
+            return
+        if self._vln_instruction_state is None or self._vln_transition_state is None:
+            raise RuntimeError("VLN instruction state must be initialized before geometry forward")
+        if not self._streaming_frame_metadata:
+            raise RuntimeError("current-frame geometry metadata is unavailable")
+
+        from ..vggt.eviction.importance_eviction import _pose_change_score
+        from ..vggt.eviction.vln_segment_transition import (
+            VLNGhostTokenMetadata,
+            build_frame_descriptor,
+            compute_instruction_segment_relevance,
+            compute_local_transition_score,
+            compute_transition_anchor,
+            concat_metadata,
+            gather_metadata,
+        )
+
+        visual = aligned_visual_tokens.reshape(-1, aligned_visual_tokens.shape[-1])
+        device = visual.device
+        meta = self._streaming_frame_metadata[-1]
+        depth_conf = meta.get("depth_conf")
+        point_conf = meta.get("conf")
+
+        def pool_conf(value, count):
+            if value is None:
+                return None
+            value = value.to(device).float().squeeze()
+            if value.ndim == 2:
+                out_h = max(1, int(round(math.sqrt(count))))
+                while out_h > 1 and count % out_h:
+                    out_h -= 1
+                value = F.adaptive_avg_pool2d(
+                    value[None, None], (out_h, count // out_h)
+                ).flatten()
+            else:
+                value = F.adaptive_avg_pool1d(value.flatten()[None, None], count).flatten()
+            return value.clamp(0, 1)
+
+        depth_c = pool_conf(depth_conf, visual.shape[0])
+        point_c = pool_conf(point_conf, visual.shape[0])
+        if depth_c is None and point_c is None:
+            confidence = torch.full((visual.shape[0],), 0.5, device=device)
+        elif depth_c is None:
+            confidence = point_c
+        elif point_c is None:
+            confidence = depth_c
+        else:
+            confidence = torch.minimum(depth_c, point_c)
+
+        relevance, best_segment = compute_instruction_segment_relevance(
+            visual, self._vln_instruction_state.segment_embeddings.to(device)
+        )
+        descriptor = build_frame_descriptor(visual, confidence)
+        transition = compute_local_transition_score(
+            descriptor, self._vln_transition_state.descriptors
+        )
+        transition_cfg = self.vln_segment_transition_weights["transition"]
+        anchor = compute_transition_anchor(
+            transition,
+            confidence,
+            relevance,
+            confidence_weight=float(transition_cfg["confidence_gate_weight"]),
+            instruction_weight=float(transition_cfg["instruction_gate_weight"]),
+        )
+
+        pose = meta.get("camera_pose")
+        current_frame_id = self._streaming_frame_idx - 1
+        if current_frame_id == 0 or len(self._streaming_frame_metadata) < 2:
+            camera = torch.tensor(0.5, device=device)
+        else:
+            prev_pose = self._streaming_frame_metadata[-2].get("camera_pose")
+            camera = (
+                _pose_change_score(prev_pose.to(device).float(), pose.to(device).float()).mean()
+                if pose is not None and prev_pose is not None else torch.tensor(0.5, device=device)
+            )
+        camera = torch.sigmoid(camera).clamp(0, 1)
+        depth = meta.get("depth")
+        if depth is None:
+            depth_structure = torch.tensor(0.5, device=device)
+        else:
+            d = depth.to(device).float().squeeze()
+            while d.ndim > 2:
+                d = d[0]
+            gx = F.pad(
+                (d[:, 1:] - d[:, :-1]).unsqueeze(0), (0, 1), mode="replicate"
+            ).squeeze(0)
+            gy = F.pad(
+                (d[1:, :] - d[:-1, :]).unsqueeze(0), (0, 0, 0, 1), mode="replicate"
+            ).squeeze(0)
+            depth_structure = torch.sigmoid(torch.sqrt(gx.square() + gy.square()).var())
+        geometry_weights = self.vln_segment_transition_weights["geometry_weights"]
+        geometry = (
+            float(geometry_weights["camera_pose_change"]) * camera
+            + float(geometry_weights["depth_structure"]) * depth_structure
+        ).clamp(0, 1)
+        score_weights = self.vln_segment_transition_weights["score_weights"]
+        merged_final = (
+            float(score_weights["geometry"]) * geometry
+            + float(score_weights["confidence"]) * confidence
+            + float(score_weights["instruction"]) * relevance
+            + float(score_weights["transition"]) * anchor
+        ).clamp(0, 1)
+
+        # Fusion merges spatial groups; assign each merged score to its source KV patches.
+        tokens_per_frame = int(self.vggt.aggregator.global_blocks[0].attn._tokens_per_frame)
+        n_special = int(self.vggt.aggregator.patch_start_idx)
+        n_patch = tokens_per_frame - n_special
+        patch_hw = self._streaming_patch_hw
+        if patch_hw is None or patch_hw[0] * patch_hw[1] != n_patch:
+            raise AssertionError(f"invalid streaming patch grid {patch_hw} for {n_patch} patches")
+        if aligned_grid_hw is None or aligned_grid_hw[0] * aligned_grid_hw[1] != visual.shape[0]:
+            raise AssertionError(
+                f"invalid aligned grid {aligned_grid_hw} for {visual.shape[0]} projected tokens"
+            )
+        patch_h, patch_w = patch_hw
+        aligned_h, aligned_w = aligned_grid_hw
+
+        def expand(x):
+            # Map each merged language token back to its exact 2-D source patches;
+            # trimmed right/bottom border patches inherit their nearest merged token.
+            grid = x.reshape(aligned_h, aligned_w)
+            y = torch.div(
+                torch.arange(patch_h, device=device) * aligned_h,
+                patch_h,
+                rounding_mode="floor",
+            ).clamp_max(aligned_h - 1)
+            x_idx = torch.div(
+                torch.arange(patch_w, device=device) * aligned_w,
+                patch_w,
+                rounding_mode="floor",
+            ).clamp_max(aligned_w - 1)
+            return grid[y[:, None], x_idx[None, :]].flatten()
+
+        score_dtype = torch.float16
+        patch_final = expand(merged_final)
+        zeros_special = torch.zeros(n_special, device=device)
+        frame_ids = torch.full((tokens_per_frame,), current_frame_id, device=device, dtype=torch.int32)
+        is_special = torch.arange(tokens_per_frame, device=device) < n_special
+        new_meta = VLNGhostTokenMetadata(
+            frame_id=frame_ids,
+            geometry_score=torch.cat([geometry.expand(n_special), geometry.expand(n_patch)]).to(score_dtype),
+            confidence_score=torch.cat([zeros_special, expand(confidence)]).to(score_dtype),
+            instruction_score=torch.cat([zeros_special, expand(relevance)]).to(score_dtype),
+            transition_score=torch.cat([zeros_special, expand(anchor)]).to(score_dtype),
+            final_score=torch.cat([geometry.expand(n_special), patch_final]).to(score_dtype),
+            is_special=is_special,
+            best_segment_id=torch.cat([
+                torch.full((n_special,), -1, device=device, dtype=torch.int16), expand(best_segment)
+            ]),
+        )
+
+        depth_layers = len(self._streaming_past_key_values)
+        if self._vln_metadata_per_layer is None:
+            self._vln_metadata_per_layer = [None] * depth_layers
+        if self._vln_layer_budgets is None:
+            raise RuntimeError("VLN layer budgets were not initialized")
+        boost = float((self.vggt_importance_weights or {}).get("special_token_boost", 0.3))
+        eps = float((self.vggt_importance_weights or {}).get("special_token_tiebreak_eps", 1e-6))
+        for layer_idx, kv in enumerate(self._streaming_past_key_values):
+            if kv is None:
+                continue
+            candidate_meta = concat_metadata(self._vln_metadata_per_layer[layer_idx], new_meta)
+            key, value = kv
+            if key.shape[2] != candidate_meta.final_score.numel():
+                raise AssertionError(
+                    f"layer {layer_idx} KV/metadata mismatch: {key.shape[2]} vs "
+                    f"{candidate_meta.final_score.numel()}"
+                )
+            layer_budget = int(self._vln_layer_budgets[layer_idx])
+            budget = min(layer_budget, key.shape[2])
+            selection = candidate_meta.final_score.float()
+            special_rank = torch.arange(selection.numel(), device=device, dtype=selection.dtype)
+            selection = selection + candidate_meta.is_special.float() * (boost + eps * special_rank)
+            keep = torch.topk(selection, k=budget, largest=True, sorted=False).indices.sort().values
+            self._streaming_past_key_values[layer_idx] = [
+                key.index_select(2, keep), value.index_select(2, keep)
+            ]
+            kept_meta = gather_metadata(candidate_meta, keep)
+            if kept_meta.final_score.numel() > layer_budget:
+                raise AssertionError(f"layer {layer_idx} exceeded its cache budget")
+            self._vln_metadata_per_layer[layer_idx] = kept_meta
+        self._vln_transition_state.descriptors.append(descriptor.detach().to(visual.dtype))
+        # Only the immediately previous pose is needed next frame. Drop old dense
+        # depth/confidence maps so this scorer does not create an unbounded side memory.
+        if len(self._streaming_frame_metadata) > 2:
+            self._streaming_frame_metadata = self._streaming_frame_metadata[-2:]
 
     def _reset_vggt_attention_cache_state(self) -> None:
         for block in self.vggt.aggregator.global_blocks:
@@ -170,7 +417,53 @@ class VGGTEncoder(BaseGeometryEncoder):
             self.vggt.aggregator.budget_proportions = torch.tensor(
                 cfg["proportions"], dtype=torch.float32
             )
+        if self.use_vln_segment_transition:
+            vln_weights_path = self._resolve_config_path(
+                self.vln_segment_transition_weights_path
+            )
+            if vln_weights_path is None:
+                raise FileNotFoundError(
+                    "Could not resolve VLN segment-transition weight profile: "
+                    f"{self.vln_segment_transition_weights_path!r}"
+                )
+            with open(vln_weights_path) as f:
+                vln_weights = json.load(f)
+            self._validate_vln_segment_transition_weights(vln_weights, vln_weights_path)
+            self.vln_segment_transition_weights = vln_weights
         self._vggt_configs_loaded = True
+
+    @staticmethod
+    def _validate_vln_segment_transition_weights(config, path: str) -> None:
+        if config.get("score_mode") != "vln_segment_transition":
+            raise ValueError(f"{path}: score_mode must be 'vln_segment_transition'")
+        required = {
+            "score_weights": ("geometry", "confidence", "instruction", "transition"),
+            "geometry_weights": ("camera_pose_change", "depth_structure"),
+        }
+        for section, names in required.items():
+            values = config.get(section)
+            if not isinstance(values, dict):
+                raise ValueError(f"{path}: missing object {section!r}")
+            for name in names:
+                value = values.get(name)
+                if not isinstance(value, (int, float)) or not 0 <= float(value) <= 1:
+                    raise ValueError(f"{path}: {section}.{name} must be in [0,1]")
+            if abs(sum(float(values[name]) for name in names) - 1.0) > 1e-6:
+                raise ValueError(f"{path}: values in {section} must sum to 1")
+        confidence = config.get("confidence", {})
+        if confidence.get("merge") != "min":
+            raise ValueError(f"{path}: confidence.merge must be 'min'")
+        transition = config.get("transition", {})
+        window = transition.get("recent_window_size")
+        if not isinstance(window, int) or window < 1:
+            raise ValueError(f"{path}: transition.recent_window_size must be a positive integer")
+        gate_names = ("confidence_gate_weight", "instruction_gate_weight")
+        for name in gate_names:
+            value = transition.get(name)
+            if not isinstance(value, (int, float)) or not 0 <= float(value) <= 1:
+                raise ValueError(f"{path}: transition.{name} must be in [0,1]")
+        if abs(sum(float(transition[name]) for name in gate_names) - 1.0) > 1e-6:
+            raise ValueError(f"{path}: transition gate weights must sum to 1")
         
     
     def encode(self, images: torch.Tensor) -> torch.Tensor:
@@ -349,6 +642,7 @@ class VGGTEncoder(BaseGeometryEncoder):
         n_image, _, height, width = images.shape
         h_patch = height // self.patch_size
         w_patch = width // self.patch_size
+        self._streaming_patch_hw = (h_patch, w_patch)
         spatial_merge_size = spatial_merge_size if spatial_merge_size and spatial_merge_size > 0 else 2
 
         if layer_indices is None:
@@ -459,6 +753,7 @@ class VGGTEncoder(BaseGeometryEncoder):
         _, height, width = frame.shape
         h_patch = height // self.patch_size
         w_patch = width // self.patch_size
+        self._streaming_patch_hw = (h_patch, w_patch)
         spatial_merge_size = spatial_merge_size if spatial_merge_size and spatial_merge_size > 0 else 2
 
         if layer_indices is None:
@@ -496,11 +791,28 @@ class VGGTEncoder(BaseGeometryEncoder):
                     past_key_values=self._streaming_past_key_values,
                     use_cache=True,
                     past_frame_idx=self._streaming_frame_idx,
-                    total_budget=self.vggt_total_budget if self.use_ghost_kv_cache else 0,
-                    eviction_mode="importance" if self.use_ghost_kv_cache else "",
-                    frame_metadata=self._streaming_frame_metadata if self.use_ghost_kv_cache else None,
-                    importance_cache=self._streaming_importance_cache if self.use_ghost_kv_cache else None,
-                    importance_weights=self.vggt_importance_weights if self.use_ghost_kv_cache else None,
+                    # The segment-transition mode prunes immediately after its existing
+                    # language-space projector runs; baseline GHOST still prunes here.
+                    total_budget=(
+                        self.vggt_total_budget
+                        if self.use_ghost_kv_cache and not self.use_vln_segment_transition else 0
+                    ),
+                    eviction_mode=(
+                        "importance"
+                        if self.use_ghost_kv_cache and not self.use_vln_segment_transition else ""
+                    ),
+                    frame_metadata=(
+                        self._streaming_frame_metadata
+                        if self.use_ghost_kv_cache and not self.use_vln_segment_transition else None
+                    ),
+                    importance_cache=(
+                        self._streaming_importance_cache
+                        if self.use_ghost_kv_cache and not self.use_vln_segment_transition else None
+                    ),
+                    importance_weights=(
+                        self.vggt_importance_weights
+                        if self.use_ghost_kv_cache and not self.use_vln_segment_transition else None
+                    ),
                 )
                 aggregated_tokens_list, patch_start_idx, self._streaming_past_key_values = output
                 if self.use_ghost_kv_cache:
@@ -687,12 +999,14 @@ class VGGTEncoder(BaseGeometryEncoder):
             images=images,
             patch_start_idx=patch_start_idx,
         )
+        keep_on_device = self.use_vln_segment_transition
+        save = (lambda tensor: tensor.detach()) if keep_on_device else (lambda tensor: tensor.detach().cpu())
         self._streaming_frame_metadata.append(
             {
-                "camera_pose": camera_pose.detach().cpu(),
-                "depth": depth[:, 0].detach().cpu(),
-                "depth_conf": depth_conf[:, 0].detach().cpu(),
-                "conf": pts3d_conf[:, 0].detach().cpu(),
+                "camera_pose": save(camera_pose),
+                "depth": save(depth[:, 0]),
+                "depth_conf": save(depth_conf[:, 0]),
+                "conf": save(pts3d_conf[:, 0]),
             }
         )
 
