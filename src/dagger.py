@@ -57,7 +57,10 @@ from habitat.utils.visualizations.utils import (
     images_to_video,
     observations_to_image,
 )
-from habitat_baselines.config.default import get_config as get_habitat_config
+# Use habitat core's config loader (same as evaluation.py). Importing
+# habitat_baselines instead pulls in the visualization stack, which crashes on
+# import in some habitat-lab/numpy combos (maps.py squeeze error).
+from habitat.config.default import get_config as get_habitat_config
 
 from habitat_extensions import measures  # noqa: F401  (registers PL / oracle measures)
 from utils.dist import get_rank, get_world_size, init_distributed_mode
