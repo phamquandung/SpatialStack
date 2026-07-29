@@ -368,6 +368,60 @@ python scripts/debug/debug_vln_pipeline.py --sample_idx 0 \
 | Trainable label | Single action string (`MOVE_FORWARD`, etc.) |
 | Forward pass | Completes without shape error; loss is finite |
 
+## Generating DAgger data with your trained SpatialStack
+
+After an initial round of training you can grow the **extra** set by having the
+trained model roll out episodes itself and correcting its drift with the shortest-path
+expert (DAgger). This mirrors JanusVLN's `src/dagger.py` but drives the SpatialStack
+Qwen3.5 + streaming-VGGT model, and writes the **same on-disk layout** that
+`create_janus_vln_data.py --use_extra_data` already consumes.
+
+```bash
+# R2R (default). 8 GPUs by default; override with NPROC_PER_NODE.
+CHECKPOINT=/path/to/your/trained/spatialstack_ckpt \
+GEOMETRY_ENCODER_PATH=/path/to/VGGT-1B \
+bash scripts/dagger.sh
+
+# RxR
+DAGGER_DATASET=RxR \
+DAGGER_DATA_PATH=data/datasets/rxr/train/train_guide_en.json.gz \
+DAGGER_GT_ANNOTATIONS_PATH=data/datasets/rxr/train/train_guide_gt.json.gz \
+CHECKPOINT=/path/to/your/trained/spatialstack_ckpt \
+bash scripts/dagger.sh
+```
+
+Output (per dataset) — directly readable by the data builder:
+
+```
+data/dagger_data/R2R/
+├── images/<scene>_r2r_<episode:06d>/rgb/<step:03d>.jpg
+├── annotations.json        # [{id, video, instructions, actions}], actions[0] = -1
+└── result.json             # per-episode collection log (save/success/pl/...)
+```
+
+Key knobs (env vars, see `scripts/dagger.sh`):
+
+| Var | Default | Meaning |
+|-----|---------|---------|
+| `DAGGER_P` | `0` | expert-mix `beta = p ** DAGGER_DATA_IT`; `0` = pure model rollout with expert correction |
+| `DAGGER_UPDATE_SIZE` | `160000` | max episodes to collect across all ranks |
+| `DAGGER_COMMIT_FREQ` | `50` | flush annotations every N saved episodes |
+| `VGGT_KV_START` / `VGGT_KV_RECENT` | `8` / `56` | streaming VGGT KV window (match your checkpoint) |
+| `SAVE_VIDEO` | `0` | dump top-down-map debug videos |
+
+Only episodes that reach the goal on an efficient path are kept
+(`distance_to_goal < 0.5m` and relative path-length under threshold), matching
+JanusVLN's filter. Then rebuild the manifest and retrain:
+
+```bash
+python scripts/data/create_janus_vln_data.py --data_root . --use_extra_data
+bash scripts/train/train_janus_vln.sh   # or your training launcher
+```
+
+> **Streaming-geometry note:** unlike JanusVLN, the collector calls the model on
+> **every** trajectory frame (even when the expert action is executed) so the VGGT
+> KV cache and frame-strict buffer stay aligned (`buffer frame i == trajectory frame i`).
+
 ## Notes
 
 - **Weights**: VLN **training** uses `Qwen/Qwen3.5-4B` (default). **Fine-tuning** uses `Journey9ni/SpatialStack-Qwen3.5-4B`. JanusVLN_Base (Qwen2.5-VL) weights are not compatible.
