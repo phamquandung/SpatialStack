@@ -41,7 +41,7 @@ sys.path.insert(0, os.path.abspath(os.path.dirname(__file__)))
 
 import torch
 import torch.distributed as dist
-from omegaconf import OmegaConf
+from types import SimpleNamespace
 from PIL import Image
 
 import habitat
@@ -125,12 +125,10 @@ class DAggerCollector:
                 gpu_id = getattr(args, "local_rank", getattr(args, "gpu", 0))
                 self.config.habitat.simulator.habitat_sim_v0.gpu_device_id = gpu_id
 
-        self.dagger_config = OmegaConf.create(
-            {
-                "p": self.args.dagger_p,
-                "update_size": self.args.dagger_update_size,
-                "commit_freq": self.args.dagger_commit_freq,
-            }
+        self.dagger_config = SimpleNamespace(
+            p=self.args.dagger_p,
+            update_size=self.args.dagger_update_size,
+            commit_freq=self.args.dagger_commit_freq,
         )
         if get_rank() == 0:
             print(self.dagger_config)
