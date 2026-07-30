@@ -16,15 +16,15 @@ if [ "${NPROC_PER_NODE}" -lt 1 ]; then
   NPROC_PER_NODE=1
 fi
 
-CHECKPOINT="${CHECKPOINT:-/mnt/samsung/Project/CoRL-ICRA/SpatialStack/model-checkpoint/spatialstack_vln_fix_0.5_full}"
-GEOMETRY_ENCODER_PATH="${GEOMETRY_ENCODER_PATH:-/mnt/samsung/Project/CoRL-ICRA/SpatialStack/model-checkpoint/VGGT-1B}"
+CHECKPOINT="${CHECKPOINT:-/media/vmo-perception/disk_2/vinhld8/checkpoints/spatialstack_janus_vln_train-gate-scale-4B-loss-3}"
+GEOMETRY_ENCODER_PATH="${GEOMETRY_ENCODER_PATH:-/media/vmo-perception/disk_2/vinhld8/checkpoints/VGGT-1B}"
 OUTPUT_PATH="${OUTPUT_PATH:-evaluation/spatialstack_vln}"
-CONFIG="${CONFIG:-config/vln_r2r.yaml}"
+CONFIG="${CONFIG:-config/vln_rxr.yaml}"
 EVAL_SPLIT="${EVAL_SPLIT:-val_unseen}"
 SAVE_VIDEO="${SAVE_VIDEO:-0}"
 # VGGT streaming KV-cache window (frames of geometry history kept during eval).
 export VGGT_KV_START="${VGGT_KV_START:-8}"
-export VGGT_KV_RECENT="${VGGT_KV_RECENT:-56}"
+export VGGT_KV_RECENT="${VGGT_KV_RECENT:-48}"
 # Oracle-stop diagnostic: auto-STOP within success_distance of the goal (isolates
 # navigation quality from the stop policy). Set VLN_ORACLE_STOP=1 to enable.
 export VLN_ORACLE_STOP="${VLN_ORACLE_STOP:-0}"

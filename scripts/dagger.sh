@@ -10,12 +10,12 @@ PROJECT_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 cd "${PROJECT_ROOT}"
 
 # ---- conda env (spatialstack-qwen35) ----
-CONDA_ENV="${CONDA_ENV:-spatialstack-qwen35}"
-if command -v conda >/dev/null 2>&1; then
-  # shellcheck disable=SC1091
-  source "$(conda info --base)/etc/profile.d/conda.sh"
-  conda activate "${CONDA_ENV}" || echo "warn: could not activate conda env '${CONDA_ENV}'"
-fi
+# CONDA_ENV="${CONDA_ENV:-spatialstack-qwen35}"
+# if command -v conda >/dev/null 2>&1; then
+#   # shellcheck disable=SC1091
+#   source "$(conda info --base)/etc/profile.d/conda.sh"
+#   conda activate "${CONDA_ENV}" || echo "warn: could not activate conda env '${CONDA_ENV}'"
+# fi
 
 export MAGNUM_LOG=quiet HABITAT_SIM_LOG=quiet
 export PROTOCOL_BUFFERS_PYTHON_IMPLEMENTATION=python
@@ -29,32 +29,41 @@ if [ "${NPROC_PER_NODE}" -lt 1 ]; then
 fi
 
 # ---- model / geometry (SpatialStack checkpoint — NOT a JanusVLN one) ----
-CHECKPOINT="${CHECKPOINT:-/mnt/samsung/Project/CoRL-ICRA/SpatialStack/model-checkpoint/spatialstack_janus_vln_train-gate-scale-4B-loss-3}"
-GEOMETRY_ENCODER_PATH="${GEOMETRY_ENCODER_PATH:-/mnt/samsung/Project/CoRL-ICRA/SpatialStack/model-checkpoint/VGGT-1B}"
+CHECKPOINT="${CHECKPOINT:-/media/vmo-perception/disk_2/vinhld8/checkpoints/spatialstack_janus_vln_train-gate-scale-4B-loss-3}"
+GEOMETRY_ENCODER_PATH="${GEOMETRY_ENCODER_PATH:-/media/vmo-perception/disk_2/vinhld8/checkpoints/VGGT-1B}"
 export GEOMETRY_ENCODER_PATH
 # Streaming VGGT KV window (must match how the checkpoint was trained/evaluated).
 export VGGT_KV_START="${VGGT_KV_START:-8}"
-export VGGT_KV_RECENT="${VGGT_KV_RECENT:-56}"
+export VGGT_KV_RECENT="${VGGT_KV_RECENT:-48}"
 # Frame-strict per-frame geometry: leave unset to follow the checkpoint config.
 # export FUSION_FRAME_STRICT=1
 
 # ---- dataset selection ----
-# R2R (default). For RxR, override the three DAGGER_* vars below.
+# R2R keeps Habitat-Lab's built-in R2RVLN-v1 loader. RxR uses the project-local
+# RxRVLNCE-v1 loader registered by src/habitat_extensions/task.py.
 DAGGER_DATASET="${DAGGER_DATASET:-R2R}"
-DAGGER_DATA_PATH="${DAGGER_DATA_PATH:-/mnt/samsung/data/datasets/R2R_VLNCE_v1-3_preprocessed/train/train.json.gz}"
-DAGGER_GT_ANNOTATIONS_PATH="${DAGGER_GT_ANNOTATIONS_PATH:-/mnt/samsung/data/datasets/R2R_VLNCE_v1-3_preprocessed/train/train_gt.json.gz}"
-
-# RxR example:
-#   DAGGER_DATASET=RxR
-#   DAGGER_DATA_PATH=.../rxr/train/train_guide_en.json.gz
-#   DAGGER_GT_ANNOTATIONS_PATH=.../rxr/train/train_guide_gt.json.gz
+case "${DAGGER_DATASET^^}" in
+  R2R)
+    DAGGER_DATA_PATH="${DAGGER_DATA_PATH:-/media/vmo-perception/disk_2/vinhld8/data/datasets/r2r/train/train.json.gz}"
+    DAGGER_GT_ANNOTATIONS_PATH="${DAGGER_GT_ANNOTATIONS_PATH:-/media/vmo-perception/disk_2/vinhld8/data/datasets/r2r/train/train_gt.json.gz}"
+    CONFIG="${CONFIG:-config/vln_dagger.yaml}"
+    ;;
+  RXR)
+    DAGGER_DATA_PATH="${DAGGER_DATA_PATH:-/media/vmo-perception/disk_2/vinhld8/data/datasets/rxr/train/train_guide.json.gz}"
+    DAGGER_GT_ANNOTATIONS_PATH="${DAGGER_GT_ANNOTATIONS_PATH:-/media/vmo-perception/disk_2/vinhld8/data/datasets/rxr/train/train_guide_gt.json.gz}"
+    CONFIG="${CONFIG:-config/vln_dagger_rxr.yaml}"
+    ;;
+  *)
+    echo "error: unsupported DAGGER_DATASET=${DAGGER_DATASET}; expected R2R or RxR" >&2
+    exit 2
+    ;;
+esac
 
 # ---- DAgger hyper-params ----
 DAGGER_UPDATE_SIZE="${DAGGER_UPDATE_SIZE:-160000}"   # max episodes to collect (across ranks)
-DAGGER_COMMIT_FREQ="${DAGGER_COMMIT_FREQ:-50}"        # flush annotations every N saved episodes
+DAGGER_COMMIT_FREQ="${DAGGER_COMMIT_FREQ:-2}"        # flush annotations every N saved episodes
 DAGGER_P="${DAGGER_P:-0}"                             # 0 = pure model rollout w/ expert correction
 DAGGER_DATA_IT="${DAGGER_DATA_IT:-3}"                 # unused when DAGGER_P=0
-CONFIG="${CONFIG:-config/vln_dagger.yaml}"
 SAVE_VIDEO="${SAVE_VIDEO:-0}"
 
 DAGGER_OUTPUT_PATH="${DAGGER_OUTPUT_PATH:-data/dagger_data/${DAGGER_DATASET}}"

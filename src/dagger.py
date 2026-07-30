@@ -30,6 +30,7 @@ import gzip
 import json
 import os
 import random
+import struct
 import sys
 import time
 from typing import Dict
@@ -62,7 +63,7 @@ from habitat.utils.visualizations.utils import (
 # import in some habitat-lab/numpy combos (maps.py squeeze error).
 from habitat.config.default import get_config as get_habitat_config
 
-from habitat_extensions import measures  # noqa: F401  (registers PL / oracle measures)
+from habitat_extensions import measures, task  # noqa: F401  (registers extensions)
 from utils.dist import get_rank, get_world_size, init_distributed_mode
 from evaluation import SpatialStackVLN_Inference, VLNEvaluator
 
@@ -75,6 +76,101 @@ MIDGOAL_RADIUS = 0.5
 GOAL_RADIUS = 0.25
 RELATIVE_PATH_LENGTH_THRESHOLD = 0.93
 SUCCESS_RELATIVE_PATH_LENGTH_THRESHOLD = 0.85
+
+_PLY_SCALAR_BYTES = {
+    "char": 1,
+    "uchar": 1,
+    "int8": 1,
+    "uint8": 1,
+    "short": 2,
+    "ushort": 2,
+    "int16": 2,
+    "uint16": 2,
+    "int": 4,
+    "uint": 4,
+    "int32": 4,
+    "uint32": 4,
+    "float": 4,
+    "float32": 4,
+    "double": 8,
+    "float64": 8,
+}
+
+
+def _validate_glb(path):
+    """Check that a GLB contains at least the byte length declared in its header."""
+    try:
+        actual_size = os.path.getsize(path)
+        with open(path, "rb") as f:
+            header = f.read(12)
+        if len(header) != 12:
+            return False, f"truncated GLB header ({len(header)}/12 bytes)"
+        magic, version, declared_size = struct.unpack("<4sII", header)
+        if magic != b"glTF":
+            return False, "invalid GLB magic"
+        if version != 2:
+            return False, f"unsupported GLB version {version}"
+        if actual_size < declared_size:
+            return False, f"truncated GLB ({actual_size}/{declared_size} bytes)"
+        return True, ""
+    except OSError as exc:
+        return False, str(exc)
+
+
+def _validate_binary_ply(path):
+    """Reject a binary PLY that cannot contain the elements in its header.
+
+    Mesh faces need at least three vertex indices. This inexpensive lower-bound
+    check catches partial MP3D semantic downloads before their native importer can
+    abort the process with SIGSEGV.
+    """
+    try:
+        actual_size = os.path.getsize(path)
+        elements = []
+        current = None
+        with open(path, "rb") as f:
+            if f.readline().strip() != b"ply":
+                return False, "invalid PLY magic"
+            format_line = f.readline().decode("ascii", errors="replace").strip()
+            if not format_line.startswith("format binary_"):
+                return True, ""
+
+            for _ in range(10000):
+                raw_line = f.readline()
+                if not raw_line:
+                    return False, "truncated PLY header"
+                line = raw_line.decode("ascii", errors="replace").strip()
+                fields = line.split()
+                if not fields:
+                    continue
+                if fields[0] == "element" and len(fields) == 3:
+                    current = {"name": fields[1], "count": int(fields[2]), "stride": 0}
+                    elements.append(current)
+                elif fields[0] == "property" and current is not None:
+                    if len(fields) == 3:
+                        scalar_size = _PLY_SCALAR_BYTES.get(fields[1])
+                        if scalar_size is None:
+                            return False, f"unknown PLY scalar type {fields[1]}"
+                        current["stride"] += scalar_size
+                    elif len(fields) == 5 and fields[1] == "list":
+                        count_size = _PLY_SCALAR_BYTES.get(fields[2])
+                        item_size = _PLY_SCALAR_BYTES.get(fields[3])
+                        if count_size is None or item_size is None:
+                            return False, "unknown PLY list type"
+                        min_items = 3 if fields[4] in {"vertex_indices", "vertex_index"} else 0
+                        current["stride"] += count_size + min_items * item_size
+                elif fields[0] == "end_header":
+                    header_size = f.tell()
+                    break
+            else:
+                return False, "PLY header is too large"
+
+        minimum_size = header_size + sum(item["count"] * item["stride"] for item in elements)
+        if actual_size < minimum_size:
+            return False, f"truncated PLY ({actual_size} bytes; minimum {minimum_size})"
+        return True, ""
+    except (OSError, UnicodeError, ValueError) as exc:
+        return False, str(exc)
 
 
 def image_resize(img, size, channels_last=True):
@@ -136,11 +232,120 @@ class DAggerCollector:
         if get_rank() == 0:
             print(self.dagger_config)
 
-    def config_env(self, scene=None) -> habitat.Env:
+    def config_env(self, scene=None, dataset=None) -> habitat.Env:
         if self.data_path is not None:
             with read_write(self.config):
                 self.config.habitat.dataset.data_path = self.data_path
-        return habitat.Env(config=self.config)
+        return habitat.Env(config=self.config, dataset=dataset)
+
+    def _scene_asset_path(self, scene_id: str) -> str:
+        """Resolve an episode scene id to the on-disk render asset path."""
+        scene_path = os.path.expanduser(str(scene_id))
+        if not os.path.isabs(scene_path):
+            scenes_dir = os.path.expanduser(str(self.config.habitat.dataset.scenes_dir))
+            scene_path = os.path.join(scenes_dir, scene_path)
+        return os.path.abspath(scene_path)
+
+    def _validate_scene_assets(self, scene_id):
+        scene_path = self._scene_asset_path(scene_id)
+        if not os.path.isfile(scene_path):
+            return False, f"missing scene asset: {scene_path}"
+
+        if scene_path.lower().endswith(".glb"):
+            valid, reason = _validate_glb(scene_path)
+            if not valid:
+                return False, f"{scene_path}: {reason}"
+
+            stem = os.path.splitext(scene_path)[0]
+            house_path = stem + ".house"
+            semantic_path = stem + "_semantic.ply"
+            if os.path.isfile(house_path):
+                if not os.path.isfile(semantic_path):
+                    return False, f"missing MP3D semantic mesh: {semantic_path}"
+                valid, reason = _validate_binary_ply(semantic_path)
+                if not valid:
+                    return False, f"{semantic_path}: {reason}"
+
+        return True, ""
+
+    @staticmethod
+    def _scene_name(scene_id: str) -> str:
+        scene_file = os.path.basename(str(scene_id).replace("\\", "/").rstrip("/"))
+        return os.path.splitext(scene_file)[0]
+
+    def _episode_key(self, scene_id, episode_id, trajectory_id=None):
+        if trajectory_id is None:
+            trajectory_id = episode_id
+        return (self._scene_name(scene_id), str(episode_id), str(trajectory_id))
+
+    def _episode_video_path(self, scene_id, episode_id) -> str:
+        return os.path.normpath(
+            os.path.join(
+                "images",
+                f"{self._scene_name(scene_id)}_{self.dataset}_{int(episode_id):06d}",
+            )
+        )
+
+    def _load_resume_state(self):
+        """Load episodes safely committed by an earlier run.
+
+        Failed/rejected episodes are complete once present in result.json. A saved
+        episode is complete only after its annotation has reached disk; this avoids
+        losing up to commit_freq - 1 annotations when a previous run crashed.
+        """
+        committed_videos = set()
+        annotation_files = []
+        if os.path.isdir(self.output_path):
+            annotation_files = [
+                os.path.join(self.output_path, name)
+                for name in os.listdir(self.output_path)
+                if name == "annotations.json"
+                or (name.startswith("annotations_") and name.endswith(".json"))
+            ]
+
+        unreadable_annotation_files = []
+        for annotation_path in annotation_files:
+            try:
+                with open(annotation_path, encoding="utf-8") as f:
+                    for item in json.load(f):
+                        video = item.get("video")
+                        if video:
+                            committed_videos.add(os.path.normpath(video))
+            except (OSError, json.JSONDecodeError, TypeError):
+                unreadable_annotation_files.append(annotation_path)
+
+        completed_episode_keys = set()
+        malformed_result_lines = 0
+        result_path = os.path.join(self.output_path, "result.json")
+        if os.path.isfile(result_path):
+            with open(result_path, encoding="utf-8") as f:
+                for line in f:
+                    if not line.strip():
+                        continue
+                    try:
+                        item = json.loads(line)
+                        episode_id = item["episode_id"]
+                        trajectory_id = item.get("trajectory_id", episode_id)
+                        key = self._episode_key(item["scene"], episode_id, trajectory_id)
+                        was_saved = bool(int(item.get("save", 0)))
+                        video = self._episode_video_path(item["scene"], episode_id)
+                    except (KeyError, TypeError, ValueError, json.JSONDecodeError):
+                        malformed_result_lines += 1
+                        continue
+
+                    if not was_saved or video in committed_videos:
+                        completed_episode_keys.add(key)
+
+        if self.rank == 0:
+            if unreadable_annotation_files:
+                print(
+                    "warn: ignoring unreadable annotation files: "
+                    + ", ".join(sorted(unreadable_annotation_files))
+                )
+            if malformed_result_lines:
+                print(f"warn: ignored {malformed_result_lines} malformed result.json lines")
+
+        return completed_episode_keys, committed_videos
 
     def generate(
         self,
@@ -387,14 +592,73 @@ class DAggerCollector:
             with torch.cuda.device(self.device):
                 torch.cuda.empty_cache()
 
-        env = self.config_env()
+        completed_episode_keys, committed_videos = self._load_resume_state()
         scene_episode_dict = {}
         episode_uuids = []
+        unavailable_scene_episodes = {}
+        resumed_episode_count = 0
         start = time.time()
-        for episode in env.episodes:
+
+        if self.data_path is not None:
+            with read_write(self.config):
+                self.config.habitat.dataset.data_path = self.data_path
+        if dataset is None:
+            from habitat.datasets import make_dataset
+
+            dataset = make_dataset(
+                id_dataset=self.config.habitat.dataset.type,
+                config=self.config.habitat.dataset,
+            )
+
+        eligible_episodes = []
+        scene_validation_cache = {}
+        for episode in dataset.episodes:
+            trajectory_id = getattr(episode, "trajectory_id", episode.episode_id)
+            episode_key = self._episode_key(
+                episode.scene_id, episode.episode_id, trajectory_id
+            )
+            episode_video = self._episode_video_path(
+                episode.scene_id, episode.episode_id
+            )
+            if episode_key in completed_episode_keys or episode_video in committed_videos:
+                resumed_episode_count += 1
+                continue
+
+            if episode.scene_id not in scene_validation_cache:
+                scene_validation_cache[episode.scene_id] = self._validate_scene_assets(
+                    episode.scene_id
+                )
+            scene_valid, reason = scene_validation_cache[episode.scene_id]
+            if not scene_valid:
+                unavailable_scene_episodes.setdefault(reason, 0)
+                unavailable_scene_episodes[reason] += 1
+                continue
+
+            eligible_episodes.append(episode)
             episode_uuid = (episode.scene_id, episode.episode_id, getattr(episode, "trajectory_id", episode.episode_id))
             episode_uuids.append(episode_uuid)
             scene_episode_dict.setdefault(episode.scene_id, []).append(episode)
+
+        if resumed_episode_count and self.rank == 0:
+            print(f"resume: skipping {resumed_episode_count} already completed episodes")
+
+        if unavailable_scene_episodes and self.rank == 0:
+            num_skipped = sum(unavailable_scene_episodes.values())
+            print(
+                f"warn: skipping {num_skipped} episodes from "
+                f"{len(unavailable_scene_episodes)} missing/incomplete scene assets; "
+                "they will be retried on the next run:"
+            )
+            for reason, episode_count in sorted(unavailable_scene_episodes.items()):
+                print(f"  {reason} ({episode_count} episodes)")
+
+        if not eligible_episodes:
+            print(f"rank {self.rank}: no eligible unfinished episodes")
+            return
+
+        dataset.episodes = eligible_episodes
+        env = self.config_env(dataset=dataset)
+
         sampled_episodes_uuids = episode_uuids
         sampled_episodes_by_scene = {}
         for scene_id in sorted(scene_episode_dict.keys()):
@@ -470,7 +734,10 @@ class DAggerCollector:
 
             self._dump_rank_annotations(annotations)
             annotations = []
-            print(f"save scene_id {scene_id} with total episodes {num_collect_episodes} time cost {time.time() - start}")
+            print(
+                f"rank {self.rank} saved {num_collect_episodes} episodes "
+                f"in {time.time() - start:.1f}s"
+            )
 
         if dist.is_available() and dist.is_initialized():
             dist.barrier()
@@ -483,6 +750,8 @@ class DAggerCollector:
                 for f in os.listdir(self.output_path)
                 if f.startswith("annotations_") and f.endswith(".json")
             ]
+            if os.path.exists(tgt_anno_path):
+                sub_tgt_anno_list.insert(0, tgt_anno_path)
             for sub_tgt_anno_path in sub_tgt_anno_list:
                 if os.path.exists(sub_tgt_anno_path):
                     merged_anno.extend(json.load(open(sub_tgt_anno_path)))

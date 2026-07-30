@@ -19,3 +19,6 @@ hf_cache/
 sam_hq_vit_h.pth
 evaluation/
 evaluation_*/
+habitat*
+!src/habitat_extensions/
+!src/habitat_extensions/task.py

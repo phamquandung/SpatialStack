@@ -26,7 +26,7 @@ from habitat.config.default_structured_configs import (
 )
 from habitat.utils.visualizations.utils import images_to_video, observations_to_image
 
-from habitat_extensions import measures  # noqa: F401
+from habitat_extensions import measures, task  # noqa: F401
 from utils.dist import get_rank, get_world_size, init_distributed_mode
 from qwen_vl.model.modeling_qwen3_5 import Qwen3_5ForConditionalGenerationWithGeometry
 
@@ -464,7 +464,13 @@ class VLNEvaluator:
         self.gt_actions_map = None
         if self.teacher_forced:
             import gzip as _gzip
-            dp = self.config.habitat.dataset.data_path.format(split=self.split)
+            roles = list(
+                getattr(self.config.habitat.dataset, "roles", ["guide"])
+            )
+            dp = self.config.habitat.dataset.data_path.format(
+                split=self.split,
+                role=roles[0] if roles else "guide",
+            )
             gt_path = (dp[: -len(".json.gz")] if dp.endswith(".json.gz") else dp) + "_gt.json.gz"
             with _gzip.open(gt_path, "rt") as f:
                 self.gt_actions_map = json.load(f)

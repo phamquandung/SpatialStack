@@ -12,6 +12,7 @@ defaults:
   - /habitat/task/lab_sensors:
     - gps_sensor
     - compass_sensor
+  - /habitat/task/measurements/oracle_success@habitat.task.measurements.oracle_success
   - _self_
 
 habitat:
@@ -50,6 +51,7 @@ habitat:
         type: SPL
       oracle_success:
         type: OracleSuccess
+        success_distance: 3.0
       oracle_navigation_error:
         type: OracleNavigationError
       pl:
@@ -58,5 +60,5 @@ habitat:
   dataset:
     type: R2RVLN-v1
     split: train
-    scenes_dir: /mnt/samsung/data/scene_dataset/mp3d_ce/
-    data_path: /mnt/samsung/data/datasets/R2R_VLNCE_v1-3_preprocessed/{split}/{split}.json.gz
+    scenes_dir: /media/vmo-perception/disk_2/vinhld8/data/scene_datasets/
+    data_path: data/datasets/r2r/{split}/{split}.json.gz
