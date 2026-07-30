@@ -238,12 +238,12 @@ class SpatialStackVLN_Inference:
             self.model.enable_vln_eval_streaming()
             if self.use_frame_strict:
                 # Incremental frame-strict: encode only the new frame each step against the
-                # growing KV, buffer its geometry, and gather each window frame's OWN
-                # buffered geometry (per-frame fusion, no broadcast). Fast + full history.
+                # growing KV, project its selected VGGT layers through the fusion MLP once,
+                # then gather cached per-frame deltas for the current window.
                 self.model.enable_vln_frame_strict_eval()
                 warnings.warn(
-                    "Frame-strict eval (incremental): per-frame geometry from a growing-KV "
-                    "buffer; encodes 1 frame/step and gathers the window per-frame.",
+                    "Frame-strict eval (incremental): encodes 1 frame/step with growing VGGT "
+                    "KV and caches post-MLP per-frame geometry deltas on CPU.",
                     stacklevel=2,
                 )
         elif not self.use_geometry:

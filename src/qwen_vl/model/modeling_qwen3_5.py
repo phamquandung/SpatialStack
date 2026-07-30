@@ -299,6 +299,7 @@ class Qwen3_5TextModelWithGeometry(Qwen3_5TextModel):
         use_cache: bool | None = None,
         cache_position: torch.LongTensor | None = None,
         geometry_layer_features: Optional[Dict[int, List[torch.Tensor]]] = None,
+        geometry_features_preprojected: bool = False,
         fusion_module: Optional[nn.Module] = None,
         image_mask: Optional[torch.Tensor] = None,
         grid_thw: Optional[torch.Tensor] = None,
@@ -405,42 +406,49 @@ class Qwen3_5TextModelWithGeometry(Qwen3_5TextModel):
                 vision_token_mask = image_mask[..., 0]
                 vision_tokens = hidden_states[vision_token_mask]
                 geo_feats = geometry_layer_features[layer_idx]
-                merge_size = getattr(fusion_module.config, "spatial_merge_size", 2)
-                geo_feats = self._tile_geometry_features_for_vision_tokens(
-                    geo_feats,
-                    vision_tokens.shape[0],
-                    merge_size,
-                    include_camera_token,
-                )
-                from qwen_vl.debug import vln_debug
+                if geometry_features_preprojected:
+                    fused = fusion_module.add_preprojected_language_geometry(
+                        vision_tokens,
+                        geo_feats,
+                        layer_idx,
+                    )
+                else:
+                    merge_size = getattr(fusion_module.config, "spatial_merge_size", 2)
+                    geo_feats = self._tile_geometry_features_for_vision_tokens(
+                        geo_feats,
+                        vision_tokens.shape[0],
+                        merge_size,
+                        include_camera_token,
+                    )
+                    from qwen_vl.debug import vln_debug
 
-                if vln_debug.is_enabled() and layer_idx == 0:
-                    geo_shape = (
-                        tuple(geo_feats[0].shape)
-                        if isinstance(geo_feats, (list, tuple))
-                        else tuple(geo_feats.shape)
+                    if vln_debug.is_enabled() and layer_idx == 0:
+                        geo_shape = (
+                            tuple(geo_feats[0].shape)
+                            if isinstance(geo_feats, (list, tuple))
+                            else tuple(geo_feats.shape)
+                        )
+                        n_geo = geo_shape[0] if geo_shape else 0
+                        tiling = vision_tokens.shape[0] // n_geo if n_geo else 0
+                        vln_debug.log_fusion(
+                            layer_idx=layer_idx,
+                            vision_tokens_shape=tuple(vision_tokens.shape),
+                            geo_shape=geo_shape,
+                            tiling_factor=tiling,
+                        )
+                    # Per-frame merged grid (h, w) for the SGF spatial-distance bias (Step 4).
+                    sgf_grid_hw = None
+                    if grid_thw is not None and len(grid_thw) > 0:
+                        _gh, _gw = grid_thw[0][1:].tolist()
+                        sgf_grid_hw = (_gh // merge_size, _gw // merge_size)
+                    fused = fusion_module(
+                        vision_tokens,
+                        geo_feats,
+                        layer_idx,
+                        vis_pos_embed_per_image,
+                        geo_pos_embed_per_image,
+                        grid_hw=sgf_grid_hw,
                     )
-                    n_geo = geo_shape[0] if geo_shape else 0
-                    tiling = vision_tokens.shape[0] // n_geo if n_geo else 0
-                    vln_debug.log_fusion(
-                        layer_idx=layer_idx,
-                        vision_tokens_shape=tuple(vision_tokens.shape),
-                        geo_shape=geo_shape,
-                        tiling_factor=tiling,
-                    )
-                # Per-frame merged grid (h, w) for the SGF spatial-distance bias (Step 4).
-                sgf_grid_hw = None
-                if grid_thw is not None and len(grid_thw) > 0:
-                    _gh, _gw = grid_thw[0][1:].tolist()
-                    sgf_grid_hw = (_gh // merge_size, _gw // merge_size)
-                fused = fusion_module(
-                    vision_tokens,
-                    geo_feats,
-                    layer_idx,
-                    vis_pos_embed_per_image,
-                    geo_pos_embed_per_image,
-                    grid_hw=sgf_grid_hw,
-                )
                 hidden_states = hidden_states.clone()
                 hidden_states[vision_token_mask] = fused
 
@@ -462,11 +470,56 @@ class Qwen3_5ModelWithGeometry(Qwen3_5Model):
         self.geometry_merger = None
         self.geometry_merger_list = None
         self._geometry_modules_initialized = False
+        self._eval_projected_geometry_cache = False
+        self._eval_window_indices = None
+        self._projected_geometry_feature_buffer = {}
 
         if getattr(config, "use_geometry_encoder", False):
             self._validate_geometry_config(config)
             if not self._should_defer_geometry_init():
                 self.initialize_geometry_modules()
+
+    def set_eval_projected_geometry_cache(self, enabled: bool) -> None:
+        self._eval_projected_geometry_cache = bool(enabled)
+        self._projected_geometry_feature_buffer = {}
+
+    def set_eval_window_indices(self, indices) -> None:
+        self._eval_window_indices = list(indices) if indices is not None else None
+
+    def reset_eval_projected_geometry_cache(self) -> None:
+        self._projected_geometry_feature_buffer = {}
+        self._eval_window_indices = None
+
+    def _cache_projected_geometry_features(self, fusion_layers, layer_features):
+        """Project the new frame once, cache deltas on CPU, and gather the window."""
+        geometry_layer_features: Dict[int, List[torch.Tensor]] = {}
+        fusion_occurrences = {}
+
+        for decoder_layer, layer_feature in zip(fusion_layers, layer_features):
+            fusion_idx = fusion_occurrences.get(decoder_layer, 0)
+            fusion_occurrences[decoder_layer] = fusion_idx + 1
+            delta = self.language_feature_fusion.project_language_add_geometry(
+                layer_feature,
+                decoder_layer,
+                fusion_layer_idx=fusion_idx,
+            )
+            cache_key = (decoder_layer, fusion_idx)
+            frame_buffer = self._projected_geometry_feature_buffer.setdefault(
+                cache_key, []
+            )
+            frame_buffer.append(delta.detach().to("cpu"))
+
+            n_buf = len(frame_buffer)
+            window = self._eval_window_indices
+            window = [i for i in window if 0 <= i < n_buf] if window else [n_buf - 1]
+            if not window:
+                window = [n_buf - 1]
+            gathered = torch.stack(
+                [frame_buffer[i] for i in window], dim=0
+            ).to(device=layer_feature.device)
+            geometry_layer_features.setdefault(decoder_layer, []).append(gathered)
+
+        return geometry_layer_features
 
     def _should_defer_geometry_init(self) -> bool:
         try:
@@ -664,6 +717,13 @@ class Qwen3_5ModelWithGeometry(Qwen3_5Model):
             if _env_fs is not None
             else bool(getattr(self.config, "geometry_frame_strict", False))
         )
+        projected_cache_mode = (
+            self._eval_projected_geometry_cache
+            and frame_strict
+            and use_streaming
+            and self.language_feature_fusion is not None
+            and self.language_feature_fusion.fusion_method == "deepstack_language_add"
+        )
 
         # Optional disk cache of the frozen VGGT layer features. VGGT is frozen, so
         # these outputs are a deterministic function of the input frames + encoder
@@ -671,7 +731,13 @@ class Qwen3_5ModelWithGeometry(Qwen3_5Model):
         # run (each sample is seen once), but is reused across re-runs / recipe sweeps
         # that change only DOWNSTREAM settings (fusion layers, stop weight, lr...).
         # Enable with env GEOMETRY_FEATURE_CACHE_DIR=/path/to/cache.
-        cache_dir = os.environ.get("GEOMETRY_FEATURE_CACHE_DIR")
+        # The projected eval cache owns its episode-local streaming state. Keep the
+        # pre-existing disk-cache behavior unchanged for every other path.
+        cache_dir = (
+            None
+            if projected_cache_mode
+            else os.environ.get("GEOMETRY_FEATURE_CACHE_DIR")
+        )
         cache_path = None
         if cache_dir:
             import hashlib
@@ -716,11 +782,20 @@ class Qwen3_5ModelWithGeometry(Qwen3_5Model):
                     f"# expect [N,T,2048] frame-strict, [1,T,2048] broadcast"
                 )
 
+        if projected_cache_mode:
+            return (
+                self._cache_projected_geometry_features(
+                    fusion_layers,
+                    layer_features,
+                ),
+                True,
+            )
+
         geometry_layer_features: Dict[int, List[torch.Tensor]] = {}
         for layer_idx, layer_feature in zip(fusion_layers, layer_features):
             geometry_layer_features.setdefault(layer_idx, []).append(layer_feature)
 
-        return geometry_layer_features
+        return geometry_layer_features, False
 
     def _collect_vision_layer_features(self, vision_hidden_states, image_grid_thw):
         fusion_layers = getattr(self.config, "geometry_fusion_layers", None)
@@ -844,6 +919,7 @@ class Qwen3_5ModelWithGeometry(Qwen3_5Model):
             )
 
         geometry_layer_features = None
+        geometry_features_preprojected = False
         fusion_module = None
         grid_thw = None
         include_camera_token = getattr(self.config, "include_camera_token", False)
@@ -872,7 +948,10 @@ class Qwen3_5ModelWithGeometry(Qwen3_5Model):
                     image_grid_thw,
                 )
             else:
-                geometry_layer_features = self._collect_geometry_layer_features(geometry_encoder_inputs)
+                (
+                    geometry_layer_features,
+                    geometry_features_preprojected,
+                ) = self._collect_geometry_layer_features(geometry_encoder_inputs)
             fusion_module = self.language_feature_fusion
             grid_thw = image_grid_thw
 
@@ -884,6 +963,7 @@ class Qwen3_5ModelWithGeometry(Qwen3_5Model):
             inputs_embeds=inputs_embeds,
             cache_position=cache_position,
             geometry_layer_features=geometry_layer_features,
+            geometry_features_preprojected=geometry_features_preprojected,
             fusion_module=fusion_module,
             image_mask=image_mask,
             grid_thw=grid_thw,
@@ -929,6 +1009,8 @@ class Qwen3_5ForConditionalGenerationWithGeometry(Qwen3_5ForConditionalGeneratio
         encoder = getattr(self.model, "geometry_encoder", None)
         if encoder is not None and hasattr(encoder, "reset_streaming_cache"):
             encoder.reset_streaming_cache()
+        if hasattr(self.model, "reset_eval_projected_geometry_cache"):
+            self.model.reset_eval_projected_geometry_cache()
 
     def enable_vln_eval_streaming(self) -> None:
         encoder = getattr(self.model, "geometry_encoder", None)
@@ -941,11 +1023,31 @@ class Qwen3_5ForConditionalGenerationWithGeometry(Qwen3_5ForConditionalGeneratio
         encoder = getattr(self.model, "geometry_encoder", None)
         if encoder is not None and hasattr(encoder, "set_eval_frame_strict"):
             encoder.set_eval_frame_strict(True)
+        fusion = getattr(self.model, "language_feature_fusion", None)
+        projected_cache_env = os.environ.get(
+            "VLN_PROJECTED_GEOMETRY_CACHE", "0"
+        ).lower()
+        use_projected_cache = (
+            fusion is not None
+            and getattr(fusion, "fusion_method", None) == "deepstack_language_add"
+            and projected_cache_env in ("1", "true", "yes")
+        )
+        if encoder is not None and hasattr(encoder, "set_eval_projected_cache"):
+            encoder.set_eval_projected_cache(use_projected_cache)
+        if hasattr(self.model, "set_eval_projected_geometry_cache"):
+            self.model.set_eval_projected_geometry_cache(use_projected_cache)
+        if use_projected_cache:
+            print(
+                "[VLN eval] frame-strict post-MLP geometry cache ENABLED "
+                "(set VLN_PROJECTED_GEOMETRY_CACHE=0 for legacy raw-feature buffering)"
+            )
 
     def set_vln_eval_window_indices(self, indices) -> None:
         encoder = getattr(self.model, "geometry_encoder", None)
         if encoder is not None and hasattr(encoder, "set_eval_window_indices"):
             encoder.set_eval_window_indices(indices)
+        if hasattr(self.model, "set_eval_window_indices"):
+            self.model.set_eval_window_indices(indices)
 
     @staticmethod
     def _stop_weighted_loss(logits, labels, stop_token_ids, stop_weight):

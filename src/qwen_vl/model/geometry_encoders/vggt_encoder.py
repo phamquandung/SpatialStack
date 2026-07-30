@@ -78,9 +78,10 @@ class VGGTEncoder(BaseGeometryEncoder):
         self._streaming_past_key_values = None
         self._streaming_frame_idx = 0
         self.last_vggt_ms = 0.0
-        # Incremental frame-strict eval: buffer each frame's geometry (computed with the
-        # growing KV) and return the requested window per-frame, instead of broadcasting.
+        # Legacy frame-strict fallback buffers raw geometry. The Qwen3.5 language-add
+        # eval path instead enables _eval_projected_cache and stores post-MLP deltas.
         self._eval_frame_strict = False
+        self._eval_projected_cache = False
         self._eval_window_indices = None
         self._frame_feature_buffer = None
         # Eval-time VGGT KV-cache window (in frames). Defaults match JanusVLN (8+48=56).
@@ -102,6 +103,12 @@ class VGGTEncoder(BaseGeometryEncoder):
         if enabled and self._frame_feature_buffer is None:
             self._frame_feature_buffer = []
 
+    def set_eval_projected_cache(self, enabled: bool) -> None:
+        """Let the Qwen fusion path cache post-MLP deltas instead of raw VGGT features."""
+        self._eval_projected_cache = bool(enabled)
+        if enabled:
+            self._frame_feature_buffer = None
+
     def set_eval_window_indices(self, indices) -> None:
         """Trajectory frame indices to gather from the per-frame buffer this step."""
         self._eval_window_indices = list(indices) if indices is not None else None
@@ -110,7 +117,9 @@ class VGGTEncoder(BaseGeometryEncoder):
         self._streaming_past_key_values = None
         self._streaming_frame_idx = 0
         self.last_vggt_ms = 0.0
-        self._frame_feature_buffer = [] if self._eval_frame_strict else None
+        self._frame_feature_buffer = (
+            [] if self._eval_frame_strict and not self._eval_projected_cache else None
+        )
         self._eval_window_indices = None
         
     
@@ -446,7 +455,7 @@ class VGGTEncoder(BaseGeometryEncoder):
             )
             tensor_features.append(geo_feature)
 
-        if self._eval_frame_strict:
+        if self._eval_frame_strict and not self._eval_projected_cache:
             # Buffer this frame's per-layer features on CPU (it was encoded with the
             # growing KV), then return the requested window gathered PER-FRAME. Each
             # buffered frame i == trajectory frame i (one frame encoded per step).

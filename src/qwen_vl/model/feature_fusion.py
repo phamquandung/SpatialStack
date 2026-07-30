@@ -541,6 +541,75 @@ class MultiLayerFeatureFusionModule(nn.Module):
 
         return fusion_layer
 
+    def project_language_add_geometry(
+        self,
+        features_3d: torch.Tensor,
+        layer_num: int,
+        fusion_layer_idx: int = 0,
+    ) -> torch.Tensor:
+        """Project geometry into a ready-to-add language-space delta.
+
+        In eval mode this projection is independent of the language/vision tokens,
+        so frame-strict inference can compute it once per trajectory frame and cache
+        the smaller projected tensor instead of repeatedly running the geometry MLP.
+        """
+        if self.fusion_method != "deepstack_language_add":
+            raise ValueError(
+                "Preprojected geometry is only valid for deepstack_language_add."
+            )
+        fusion_layers = self.get_fusion_layer(layer_num)
+        if not 0 <= fusion_layer_idx < len(fusion_layers):
+            raise IndexError(
+                f"fusion_layer_idx {fusion_layer_idx} out of range for layer "
+                f"{layer_num} ({len(fusion_layers)} blocks)"
+            )
+        fusion_layer = fusion_layers[fusion_layer_idx]
+        geo_feats = fusion_layer["geo_ln"](features_3d)
+        geo_feats = geo_feats.reshape(
+            -1,
+            self.config.geo_hidden_size * self.config.spatial_merge_size ** 2,
+        )
+        delta = fusion_layer["geo_mlp"](geo_feats)
+        if "geo_gate" in fusion_layer:
+            delta = fusion_layer["geo_gate"](geo_feats) * delta
+        if "geo_scale" in fusion_layer:
+            delta = fusion_layer["geo_scale"](delta)
+        else:
+            delta = self.fusion_scale * delta
+        return delta
+
+    def add_preprojected_language_geometry(
+        self,
+        features_2d: torch.Tensor,
+        projected_deltas,
+        layer_num: int,
+    ) -> torch.Tensor:
+        """Add cached language-space geometry deltas without rerunning the MLP."""
+        if self.fusion_method != "deepstack_language_add":
+            raise ValueError(
+                "Preprojected geometry is only valid for deepstack_language_add."
+            )
+        deltas = (
+            list(projected_deltas)
+            if isinstance(projected_deltas, (list, tuple))
+            else [projected_deltas]
+        )
+        fusion_layers = self.get_fusion_layer(layer_num)
+        if len(deltas) not in (1, len(fusion_layers)):
+            raise ValueError(
+                f"Expected 1 or {len(fusion_layers)} projected deltas for layer "
+                f"{layer_num}, got {len(deltas)}"
+            )
+        for delta in deltas:
+            delta = delta.reshape(-1, delta.shape[-1])
+            if delta.shape != features_2d.shape:
+                raise ValueError(
+                    "Preprojected geometry shape mismatch: "
+                    f"features_2d={tuple(features_2d.shape)}, delta={tuple(delta.shape)}"
+                )
+            features_2d = features_2d + delta
+        return features_2d
+
     def reset_residual_branches_to_noop(self) -> None:
         if self.config.fusion_method == "deepstack_language_add":
             for fusion_layers in self.fusion_layers.values():
