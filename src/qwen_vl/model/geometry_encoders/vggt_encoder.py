@@ -1,7 +1,6 @@
 """VGGT geometry encoder implementation."""
 
 import json
-import math
 import os
 import torch
 import torch.nn as nn
@@ -114,6 +113,8 @@ class VGGTEncoder(BaseGeometryEncoder):
         self._vln_transition_state = None
         self._vln_metadata_per_layer = None
         self._vln_layer_budgets = None
+        self._vln_score_probe = None
+        self._vln_expand_index_cache = None
         self.vggt_total_budget = int(config.vggt_total_budget)
         self.vggt_importance_weights_path = config.vggt_importance_weights_path
         self.vggt_budget_proportions_path = config.vggt_budget_proportions_path
@@ -168,6 +169,7 @@ class VGGTEncoder(BaseGeometryEncoder):
         if not self.use_vln_segment_transition:
             return
         from ..vggt.eviction.vln_segment_transition import RecentTransitionState
+        from ..vggt.eviction.vln_score_probe import VLNScoreProbe
 
         self._load_vggt_configs()
         transition_cfg = self.vln_segment_transition_weights["transition"]
@@ -176,6 +178,14 @@ class VGGTEncoder(BaseGeometryEncoder):
             max_frames=int(transition_cfg["recent_window_size"])
         )
         self._vln_metadata_per_layer = None
+        # Read-only score instrumentation; a no-op unless VLN_SCORE_PROBE=1.
+        if self._vln_score_probe is not None:
+            self._vln_score_probe.flush()
+        self._vln_score_probe = VLNScoreProbe(
+            num_segments=int(state.segment_embeddings.shape[0]),
+            instruction=state.raw_instruction,
+        )
+        self._vln_score_probe.start_episode(getattr(state, "raw_instruction", "")[:64])
         # Resolve fixed offline-profiled budgets once during episode initialization,
         # outside the per-frame scorer (which stays GPU-only and synchronization-free).
         self._vln_layer_budgets = self.vggt.aggregator._calculate_dynamic_budgets(
@@ -219,23 +229,41 @@ class VGGTEncoder(BaseGeometryEncoder):
         depth_conf = meta.get("depth_conf")
         point_conf = meta.get("conf")
 
-        def pool_conf(value, count):
+        # Resolve the token grids up front: confidence must be pooled onto the *actual*
+        # merged grid, not onto a near-square factorisation of the token count.
+        tokens_per_frame = int(self.vggt.aggregator.global_blocks[0].attn._tokens_per_frame)
+        n_special = int(self.vggt.aggregator.patch_start_idx)
+        n_patch = tokens_per_frame - n_special
+        patch_hw = self._streaming_patch_hw
+        if patch_hw is None or patch_hw[0] * patch_hw[1] != n_patch:
+            raise AssertionError(f"invalid streaming patch grid {patch_hw} for {n_patch} patches")
+        if aligned_grid_hw is None or aligned_grid_hw[0] * aligned_grid_hw[1] != visual.shape[0]:
+            raise AssertionError(
+                f"invalid aligned grid {aligned_grid_hw} for {visual.shape[0]} projected tokens"
+            )
+        patch_h, patch_w = patch_hw
+        aligned_h, aligned_w = aligned_grid_hw
+
+        def pool_conf(value):
             if value is None:
                 return None
             value = value.to(device).float().squeeze()
             if value.ndim == 2:
-                out_h = max(1, int(round(math.sqrt(count))))
-                while out_h > 1 and count % out_h:
-                    out_h -= 1
                 value = F.adaptive_avg_pool2d(
-                    value[None, None], (out_h, count // out_h)
+                    value[None, None], (aligned_h, aligned_w)
                 ).flatten()
             else:
-                value = F.adaptive_avg_pool1d(value.flatten()[None, None], count).flatten()
-            return value.clamp(0, 1)
+                value = F.adaptive_avg_pool1d(
+                    value.flatten()[None, None], aligned_h * aligned_w
+                ).flatten()
+            # VGGT emits confidence through `expp1` (head_act.activate_head), i.e.
+            # conf = 1 + exp(x) in (1, inf). Clamping to [0,1] would saturate every
+            # token to exactly 1.0 and silently kill this term, the descriptor
+            # weighting and the transition gate. Map monotonically onto [0,1) instead.
+            return (1.0 - 1.0 / value.clamp_min(1.0 + 1e-6)).clamp(0, 1)
 
-        depth_c = pool_conf(depth_conf, visual.shape[0])
-        point_c = pool_conf(point_conf, visual.shape[0])
+        depth_c = pool_conf(depth_conf)
+        point_c = pool_conf(point_conf)
         if depth_c is None and point_c is None:
             confidence = torch.full((visual.shape[0],), 0.5, device=device)
         elif depth_c is None:
@@ -300,60 +328,66 @@ class VGGTEncoder(BaseGeometryEncoder):
         ).clamp(0, 1)
 
         # Fusion merges spatial groups; assign each merged score to its source KV patches.
-        tokens_per_frame = int(self.vggt.aggregator.global_blocks[0].attn._tokens_per_frame)
-        n_special = int(self.vggt.aggregator.patch_start_idx)
-        n_patch = tokens_per_frame - n_special
-        patch_hw = self._streaming_patch_hw
-        if patch_hw is None or patch_hw[0] * patch_hw[1] != n_patch:
-            raise AssertionError(f"invalid streaming patch grid {patch_hw} for {n_patch} patches")
-        if aligned_grid_hw is None or aligned_grid_hw[0] * aligned_grid_hw[1] != visual.shape[0]:
-            raise AssertionError(
-                f"invalid aligned grid {aligned_grid_hw} for {visual.shape[0]} projected tokens"
-            )
-        patch_h, patch_w = patch_hw
-        aligned_h, aligned_w = aligned_grid_hw
+        # The merge is an exact floor-divide by `merge`, so invert it that way: scaling by
+        # aligned_h/patch_h is only equivalent when patch_h is even, and silently shifts
+        # every other row when the patch grid is odd.
+        expand_index = self._vln_expand_index(patch_h, patch_w, aligned_h, aligned_w, device)
 
         def expand(x):
             # Map each merged language token back to its exact 2-D source patches;
             # trimmed right/bottom border patches inherit their nearest merged token.
-            grid = x.reshape(aligned_h, aligned_w)
-            y = torch.div(
-                torch.arange(patch_h, device=device) * aligned_h,
-                patch_h,
-                rounding_mode="floor",
-            ).clamp_max(aligned_h - 1)
-            x_idx = torch.div(
-                torch.arange(patch_w, device=device) * aligned_w,
-                patch_w,
-                rounding_mode="floor",
-            ).clamp_max(aligned_w - 1)
-            return grid[y[:, None], x_idx[None, :]].flatten()
+            return x.reshape(-1).index_select(0, expand_index)
 
         score_dtype = torch.float16
+        boost = float((self.vggt_importance_weights or {}).get("special_token_boost", 0.3))
+        eps = float((self.vggt_importance_weights or {}).get("special_token_tiebreak_eps", 1e-6))
         patch_final = expand(merged_final)
         zeros_special = torch.zeros(n_special, device=device)
         frame_ids = torch.full((tokens_per_frame,), current_frame_id, device=device, dtype=torch.int32)
         is_special = torch.arange(tokens_per_frame, device=device) < n_special
+        # GHOST Eq. 7: phi(t, p_sp) = s_frame(t) + boost + eps * r, where r is the
+        # INTRA-FRAME rank of the special token. Baking the privilege in here keeps the
+        # tiebreak infinitesimal; deriving it in the eviction loop from the token's
+        # position in the (growing) cache would scale it with cache size instead.
+        special_final = geometry + boost + eps * torch.arange(
+            n_special, device=device, dtype=torch.float32
+        )
+        # final_score stays fp32: the realised score range is ~1e-2 while the fp16 ulp
+        # near 0.6 is ~4.9e-4, which would collapse most of a frame into exact ties and
+        # hand the eviction decision to topk's tiebreak.
         new_meta = VLNGhostTokenMetadata(
             frame_id=frame_ids,
-            geometry_score=torch.cat([geometry.expand(n_special), geometry.expand(n_patch)]).to(score_dtype),
+            geometry_score=geometry.expand(tokens_per_frame).to(score_dtype),
             confidence_score=torch.cat([zeros_special, expand(confidence)]).to(score_dtype),
             instruction_score=torch.cat([zeros_special, expand(relevance)]).to(score_dtype),
             transition_score=torch.cat([zeros_special, expand(anchor)]).to(score_dtype),
-            final_score=torch.cat([geometry.expand(n_special), patch_final]).to(score_dtype),
+            final_score=torch.cat([special_final, patch_final]).float(),
             is_special=is_special,
             best_segment_id=torch.cat([
                 torch.full((n_special,), -1, device=device, dtype=torch.int16), expand(best_segment)
             ]),
         )
 
+        probe = self._vln_score_probe
+        if probe is not None and probe.should_log(current_frame_id):
+            probe.log_frame_scores(
+                current_frame_id,
+                geometry=geometry,
+                camera=camera,
+                depth_structure=depth_structure,
+                confidence=confidence,
+                instruction=relevance,
+                transition_scalar=transition,
+                anchor=anchor,
+                final=merged_final,
+                best_segment=best_segment,
+            )
+
         depth_layers = len(self._streaming_past_key_values)
         if self._vln_metadata_per_layer is None:
             self._vln_metadata_per_layer = [None] * depth_layers
         if self._vln_layer_budgets is None:
             raise RuntimeError("VLN layer budgets were not initialized")
-        boost = float((self.vggt_importance_weights or {}).get("special_token_boost", 0.3))
-        eps = float((self.vggt_importance_weights or {}).get("special_token_tiebreak_eps", 1e-6))
         for layer_idx, kv in enumerate(self._streaming_past_key_values):
             if kv is None:
                 continue
@@ -365,23 +399,49 @@ class VGGTEncoder(BaseGeometryEncoder):
                     f"{candidate_meta.final_score.numel()}"
                 )
             layer_budget = int(self._vln_layer_budgets[layer_idx])
-            budget = min(layer_budget, key.shape[2])
-            selection = candidate_meta.final_score.float()
-            special_rank = torch.arange(selection.numel(), device=device, dtype=selection.dtype)
-            selection = selection + candidate_meta.is_special.float() * (boost + eps * special_rank)
-            keep = torch.topk(selection, k=budget, largest=True, sorted=False).indices.sort().values
-            self._streaming_past_key_values[layer_idx] = [
-                key.index_select(2, keep), value.index_select(2, keep)
-            ]
-            kept_meta = gather_metadata(candidate_meta, keep)
-            if kept_meta.final_score.numel() > layer_budget:
-                raise AssertionError(f"layer {layer_idx} exceeded its cache budget")
-            self._vln_metadata_per_layer[layer_idx] = kept_meta
-        self._vln_transition_state.descriptors.append(descriptor.detach().to(visual.dtype))
+            if key.shape[2] > layer_budget:
+                # Only pay for the gather when the layer is actually over budget: a
+                # full-cache index_select moves ~2 * 2048 * T bytes per layer and is a
+                # pure no-op while the cache is still filling.
+                keep = torch.topk(
+                    candidate_meta.final_score, k=layer_budget, largest=True, sorted=False
+                ).indices.sort().values
+                self._streaming_past_key_values[layer_idx] = [
+                    key.index_select(2, keep), value.index_select(2, keep)
+                ]
+                candidate_meta = gather_metadata(candidate_meta, keep)
+                if candidate_meta.final_score.numel() > layer_budget:
+                    raise AssertionError(f"layer {layer_idx} exceeded its cache budget")
+            self._vln_metadata_per_layer[layer_idx] = candidate_meta
+            if probe is not None:
+                probe.log_layer_retention(current_frame_id, layer_idx, candidate_meta, layer_budget)
+        # Keep the descriptor fp32 and already L2-normalised: casting it to the visual
+        # dtype only to cast it back (and re-normalise) next frame loses precision on a
+        # cosine that consecutive VLN frames drive to within ~1e-3 of each other.
+        self._vln_transition_state.descriptors.append(descriptor.detach())
         # Only the immediately previous pose is needed next frame. Drop old dense
         # depth/confidence maps so this scorer does not create an unbounded side memory.
         if len(self._streaming_frame_metadata) > 2:
             self._streaming_frame_metadata = self._streaming_frame_metadata[-2:]
+
+    def _vln_expand_index(self, patch_h, patch_w, aligned_h, aligned_w, device):
+        """Flat merged-grid index for every source patch, cached across frames.
+
+        The projector merges each `merge x merge` patch block into one language token,
+        so the inverse map is a floor-divide; right/bottom patches trimmed before the
+        merge fall back to the last merged row/column.
+        """
+        key = (patch_h, patch_w, aligned_h, aligned_w, str(device))
+        cached = self._vln_expand_index_cache
+        if cached is not None and cached[0] == key:
+            return cached[1]
+        merge_h = max(1, patch_h // aligned_h)
+        merge_w = max(1, patch_w // aligned_w)
+        y = torch.arange(patch_h, device=device).div(merge_h, rounding_mode="floor").clamp_max(aligned_h - 1)
+        x = torch.arange(patch_w, device=device).div(merge_w, rounding_mode="floor").clamp_max(aligned_w - 1)
+        index = (y[:, None] * aligned_w + x[None, :]).reshape(-1)
+        self._vln_expand_index_cache = (key, index)
+        return index
 
     def _reset_vggt_attention_cache_state(self) -> None:
         for block in self.vggt.aggregator.global_blocks:
