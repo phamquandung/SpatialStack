@@ -15,7 +15,7 @@ the geometry encoder enabled. Its geometry settings match the released
 - `GEOMETRY_ENCODER_LAYERS="11 17 23"`
 - `GEOMETRY_FUSION_LAYERS="0 1 2"`
 
-## Data Preparation
+## Data Preparation//
 
 The default training mix reads these paths:
 
