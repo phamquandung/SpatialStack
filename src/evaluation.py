@@ -193,6 +193,20 @@ def vggt_kv_bytes(past_key_values):
     return total
 
 
+def vln_metadata_bytes(metadata_per_layer):
+    """Return storage owned by per-token eviction metadata across VGGT layers."""
+    if metadata_per_layer is None:
+        return 0
+    total = 0
+    for metadata in metadata_per_layer:
+        if metadata is None:
+            continue
+        for value in vars(metadata).values():
+            if torch.is_tensor(value):
+                total += value.numel() * value.element_size()
+    return total
+
+
 class SpatialStackVLN_Inference:
     def __init__(self, pretrained: str, device: str = "cuda", geometry_encoder_path: Optional[str] = None):
         require_qwen3_5_support()
@@ -291,6 +305,25 @@ class SpatialStackVLN_Inference:
         if encoder is None:
             return None
         return getattr(encoder, "_streaming_past_key_values", None)
+
+    def _geometry_cache_memory_mb(self):
+        encoder = getattr(self.model.model, "geometry_encoder", None)
+        if encoder is None:
+            return {"kv": 0.0, "camera_kv": 0.0, "metadata": 0.0, "total": 0.0}
+        scale = 1024 ** 2
+        kv = vggt_kv_bytes(getattr(encoder, "_streaming_past_key_values", None)) / scale
+        camera_kv = vggt_kv_bytes(
+            getattr(encoder, "_streaming_past_key_values_camera", None)
+        ) / scale
+        metadata = vln_metadata_bytes(
+            getattr(encoder, "_vln_metadata_per_layer", None)
+        ) / scale
+        return {
+            "kv": kv,
+            "camera_kv": camera_kv,
+            "metadata": metadata,
+            "total": kv + camera_kv + metadata,
+        }
 
     def _last_vggt_ms(self):
         encoder = getattr(self.model.model, "geometry_encoder", None)
@@ -555,6 +588,9 @@ class VLNEvaluator:
                 ep_peak_alloc = 0.0
                 ep_peak_reserved = 0.0
                 ep_peak_vggt_kv = 0.0
+                ep_peak_vggt_camera_kv = 0.0
+                ep_peak_vggt_metadata = 0.0
+                ep_peak_vggt_cache_total = 0.0
                 ep_t0 = time.perf_counter()
                 step_times_ms = []
                 vggt_times_ms = []
@@ -597,9 +633,16 @@ class VLNEvaluator:
                     mem_stats = read_peak_memory_stats(self.device)
                     ep_peak_alloc = max(ep_peak_alloc, mem_stats["peak_allocated_mb"])
                     ep_peak_reserved = max(ep_peak_reserved, mem_stats["peak_reserved_mb"])
-                    ep_peak_vggt_kv = max(
-                        ep_peak_vggt_kv,
-                        vggt_kv_bytes(self.model._geometry_kv_cache()) / 1024 ** 2,
+                    cache_memory = self.model._geometry_cache_memory_mb()
+                    ep_peak_vggt_kv = max(ep_peak_vggt_kv, cache_memory["kv"])
+                    ep_peak_vggt_camera_kv = max(
+                        ep_peak_vggt_camera_kv, cache_memory["camera_kv"]
+                    )
+                    ep_peak_vggt_metadata = max(
+                        ep_peak_vggt_metadata, cache_memory["metadata"]
+                    )
+                    ep_peak_vggt_cache_total = max(
+                        ep_peak_vggt_cache_total, cache_memory["total"]
                     )
                     if torch.cuda.is_available():
                         torch.cuda.empty_cache()
@@ -623,7 +666,9 @@ class VLNEvaluator:
                         action = pred_action
                         if self.oracle_stop and info.get("distance_to_goal", float("inf")) <= self.success_distance:
                             action = 0
-                        if step_id >= self.args.max_steps:
+                        # step_id is zero-based and this action is counted immediately
+                        # below, so force STOP on the max_steps-th action, not one later.
+                        if step_id >= self.args.max_steps - 1:
                             action = 0
 
                     observations = env.step(action)
@@ -663,6 +708,9 @@ class VLNEvaluator:
                     "steps": step_id,
                     "episode_instruction": episode_instruction,
                     "peak_vggt_kv_mb": ep_peak_vggt_kv,
+                    "peak_vggt_camera_kv_mb": ep_peak_vggt_camera_kv,
+                    "peak_vggt_metadata_mb": ep_peak_vggt_metadata,
+                    "peak_vggt_cache_total_mb": ep_peak_vggt_cache_total,
                     "peak_alloc_mb": ep_peak_alloc,
                     "peak_reserved_mb": ep_peak_reserved,
                     "mean_step_ms": float(np.mean(step_times_ms)) if step_times_ms else 0.0,

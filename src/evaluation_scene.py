@@ -4,6 +4,9 @@ from evaluation import SpatialStackVLN_Inference, evaluate, init_distributed_mod
 
 
 def parse_scene_ids(scene_ids: str):
+    scene_ids = scene_ids.strip()
+    if scene_ids.lower() in {"none", "all"}:
+        return None
     return {scene_id.strip() for scene_id in scene_ids.split(",") if scene_id.strip()}
 
 
@@ -18,7 +21,7 @@ def eval_scene():
         "--scene_ids",
         type=str,
         required=True,
-        help="Comma-separated MP3D scene ids to skip (e.g. EU6Fwq7SyZv).",
+        help="Comma-separated MP3D scene ids to skip, or 'none'/'all' to skip none.",
     )
     parser.add_argument("--output_path", type=str, default="./evaluation/scene")
     parser.add_argument("--save_video", action="store_true", default=False)
@@ -35,7 +38,7 @@ def eval_scene():
 
     args = parser.parse_args()
     scene_filter = parse_scene_ids(args.scene_ids)
-    if not scene_filter:
+    if scene_filter == set():
         raise ValueError("--scene_ids must contain at least one scene id to skip")
 
     set_seed(args.seed)

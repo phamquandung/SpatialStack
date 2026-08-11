@@ -14,7 +14,9 @@ NAVIGATION_VERBS = {
     "continue", "stop", "head", "proceed", "cross", "follow", "approach",
     "face", "take", "veer", "step",
 }
-_MARKER_RE = re.compile(r"\b(?:and\s+then|after\s+that|then|next)\b", re.I)
+# "next" is a sequencing marker only when it is not the spatial preposition "next to":
+# "stop next to the plant" is one action, not two.
+_MARKER_RE = re.compile(r"\b(?:and\s+then|after\s+that|then|next\b(?!\s+to\b))\b", re.I)
 _ACTION_AND_RE = re.compile(
     r"\band\b(?=\s+(?:" + "|".join(sorted(NAVIGATION_VERBS)) + r")\b)", re.I
 )
@@ -53,6 +55,52 @@ class VLNGhostTokenMetadata:
     best_segment_id: Optional[torch.Tensor] = None
 
 
+@torch.no_grad()
+def zscore_normalize(scores: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
+    """Standardize scores without amplifying a constant or numerically dead term."""
+    values = scores.float()
+    if values.numel() == 0:
+        raise ValueError("cannot z-score an empty score tensor")
+    centered = values - values.mean()
+    scale = centered.square().mean().sqrt()
+    normalized = centered / scale.clamp_min(eps)
+    return normalized * (scale > eps).to(normalized.dtype)
+
+
+@torch.no_grad()
+def compute_candidate_final_score(
+    metadata: VLNGhostTokenMetadata,
+    score_weights,
+    special_token_boost: float,
+) -> Tuple[torch.Tensor, dict]:
+    """Combine cache-wide standardized components for the eviction decision.
+
+    Normalization happens over exactly the patch-token population considered by
+    ``topk``. This removes the realised-scale mismatch between confidence, language
+    relevance, geometry, and transition while preserving every component's ordering
+    across both frames and tokens. Special tokens are scored above the best patch and
+    therefore retain their explicit GHOST privilege.
+    """
+    patch_mask = ~metadata.is_special.bool()
+    components = {
+        "geometry": metadata.geometry_score,
+        "confidence": metadata.confidence_score,
+        "instruction": metadata.instruction_score,
+        "transition": metadata.transition_score,
+    }
+    patch_final = torch.zeros_like(metadata.final_score[patch_mask], dtype=torch.float32)
+    normalized_components = {
+        name: zscore_normalize(values[patch_mask]) for name, values in components.items()
+    }
+    for name, values in normalized_components.items():
+        patch_final.add_(values, alpha=float(score_weights[name]))
+
+    final = torch.empty_like(metadata.final_score, dtype=torch.float32)
+    final[patch_mask] = patch_final
+    final[~patch_mask] = patch_final.max() + float(special_token_boost)
+    return final, normalized_components
+
+
 def split_instruction_with_spans(instruction: str) -> List[Tuple[int, int]]:
     """Return ordered action/clause spans while preserving every non-space character."""
     if not instruction or not instruction.strip():
@@ -77,25 +125,48 @@ def split_instruction_with_spans(instruction: str) -> List[Tuple[int, int]]:
     return spans
 
 
-def assign_tokens_to_segments(
+def token_segment_overlap(
     offset_mapping: torch.Tensor, segment_char_spans: Sequence[Tuple[int, int]]
-) -> torch.Tensor:
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Return ``([L, S]`` character overlap, ``[L]`` "is a real text token" mask).
+
+    Tokenizer specials carry the offset ``(0, 0)``; they overlap nothing and are excluded
+    from every segment.
+    """
     offsets = torch.as_tensor(offset_mapping)
     if offsets.ndim == 3 and offsets.shape[0] == 1:
         offsets = offsets[0]
     if offsets.ndim != 2 or offsets.shape[-1] != 2:
         raise ValueError(f"offset_mapping must have shape [L,2], got {tuple(offsets.shape)}")
-    result = torch.full((offsets.shape[0],), -1, dtype=torch.int32, device=offsets.device)
+    offsets = offsets.long()
     spans = torch.tensor(segment_char_spans, dtype=torch.long, device=offsets.device)
-    for token_idx, (start, end) in enumerate(offsets.long()):
-        if end <= start:
-            continue
-        overlap = (torch.minimum(end, spans[:, 1]) - torch.maximum(start, spans[:, 0])).clamp_min(0)
-        best = int(overlap.argmax())
-        if overlap[best] > 0:
-            result[token_idx] = best
-        else:
-            raise ValueError(f"normal instruction token at offset [{start}, {end}) has no segment")
+    starts, ends = offsets[:, :1], offsets[:, 1:]
+    is_text = (ends > starts).squeeze(-1)
+    overlap = (
+        torch.minimum(ends, spans[:, 1]) - torch.maximum(starts, spans[:, 0])
+    ).clamp_min(0) * is_text[:, None]
+    return overlap, is_text
+
+
+def assign_tokens_to_segments(
+    offset_mapping: torch.Tensor, segment_char_spans: Sequence[Tuple[int, int]]
+) -> torch.Tensor:
+    overlap, is_text = token_segment_overlap(offset_mapping, segment_char_spans)
+    best_overlap, best = overlap.max(dim=-1)
+    result = torch.full(overlap.shape[:1], -1, dtype=torch.int32, device=overlap.device)
+    assigned = best_overlap > 0
+    result[assigned] = best[assigned].to(torch.int32)
+    # Whitespace-only spans are dropped by split_instruction_with_spans, so a tokenizer
+    # that emits e.g. a leading "  " as its own token overlaps nothing. Fall back to the
+    # nearest segment instead of aborting the episode.
+    orphan = is_text & ~assigned
+    if orphan.any():
+        spans = torch.tensor(
+            segment_char_spans, dtype=torch.long, device=overlap.device
+        )
+        ends = torch.as_tensor(offset_mapping).reshape(-1, 2).long()[:, 1:]
+        nearest = (spans[:, 0][None, :] - ends).abs().argmin(dim=-1)
+        result[orphan] = nearest[orphan].to(torch.int32)
     return result
 
 
@@ -111,18 +182,24 @@ def build_instruction_segment_state(instruction, tokenizer, input_embedding_laye
     input_ids = encoded["input_ids"][0].to(device)
     attention_mask = encoded.get("attention_mask", torch.ones_like(encoded["input_ids"]))[0].to(device)
     spans = split_instruction_with_spans(instruction)
+    overlap, is_text = token_segment_overlap(encoded["offset_mapping"][0], spans)
     segment_ids = assign_tokens_to_segments(encoded["offset_mapping"][0], spans).to(device)
     token_embeddings = input_embedding_layer(input_ids)
+    overlap = overlap.to(device)
     pooled = []
     for segment_id in range(len(spans)):
         mask = segment_ids == segment_id
         if not mask.any():
+            # A token straddling a boundary is assigned to whichever segment it overlaps
+            # most, which can starve a short neighbour. Pool that segment from every
+            # token touching it rather than aborting the episode.
+            mask = overlap[:, segment_id] > 0
+        if not mask.any():
             raise ValueError(f"instruction segment {segment_id} contains no tokenizer tokens")
         pooled.append(F.normalize(token_embeddings[mask].float().mean(0), dim=0))
     segment_embeddings = torch.stack(pooled)
-    normal = encoded["offset_mapping"][0].ne(0).any(dim=-1).to(device)
-    if (segment_ids[normal] < 0).any():
-        raise AssertionError("every normal instruction token must have a segment id")
+    if (segment_ids[is_text.to(device)] < 0).any():
+        raise AssertionError("every real instruction token must have a segment id")
     return InstructionSegmentState(
         raw_instruction=instruction,
         input_ids=input_ids,
@@ -142,9 +219,9 @@ def compute_instruction_segment_relevance(aligned_visual_tokens, segment_embeddi
             f"language-space dimension mismatch: visual={aligned_visual_tokens.shape[-1]}, "
             f"text={segment_embeddings.shape[-1]}"
         )
-    similarity = F.normalize(aligned_visual_tokens.float(), dim=-1) @ F.normalize(
-        segment_embeddings.float(), dim=-1
-    ).T
+    # segment_embeddings are already L2-normalised by build_instruction_segment_state and
+    # are frozen for the episode, so only the visual side needs normalising each frame.
+    similarity = F.normalize(aligned_visual_tokens.float(), dim=-1) @ segment_embeddings.T
     best, best_id = similarity.max(dim=-1)
     return ((best.clamp(-1, 1) + 1) * 0.5), best_id.to(torch.int16)
 
@@ -163,8 +240,10 @@ def build_frame_descriptor(aligned_visual_tokens, confidence):
 def compute_local_transition_score(current_descriptor, recent_descriptors):
     if not recent_descriptors:
         return current_descriptor.new_zeros((), dtype=torch.float32)
-    recent = torch.stack([x.to(current_descriptor.device).float() for x in recent_descriptors])
-    cosine = F.normalize(recent, dim=-1) @ F.normalize(current_descriptor.float(), dim=-1)
+    # Both sides come out of build_frame_descriptor already L2-normalised in fp32, so the
+    # matvec is the cosine directly.
+    recent = torch.stack([x.to(current_descriptor.device) for x in recent_descriptors]).float()
+    cosine = recent @ current_descriptor.float()
     return ((1 - cosine.clamp(-1, 1)) * 0.5).mean().clamp(0, 1)
 
 
@@ -189,7 +268,14 @@ def concat_metadata(old, new):
     values = {}
     for field in fields(VLNGhostTokenMetadata):
         lhs, rhs = getattr(old, field.name), getattr(new, field.name)
-        values[field.name] = None if lhs is None or rhs is None else torch.cat([lhs, rhs], dim=0)
+        if (lhs is None) != (rhs is None):
+            # Silently returning None here would drop the field from the cache forever
+            # and desynchronise it from the K/V it describes.
+            raise ValueError(
+                f"metadata field {field.name!r} is present on one side only "
+                f"(old={lhs is None}, new={rhs is None})"
+            )
+        values[field.name] = None if lhs is None else torch.cat([lhs, rhs], dim=0)
     return VLNGhostTokenMetadata(**values)
 
 
