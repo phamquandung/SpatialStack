@@ -115,7 +115,14 @@ class VGGTEncoder(BaseGeometryEncoder):
         self._vln_layer_budgets = None
         self._vln_score_probe = None
         self._vln_expand_index_cache = None
-        self.vggt_total_budget = int(config.vggt_total_budget)
+        self.vggt_total_budget = int(
+            os.environ.get("VGGT_TOTAL_BUDGET", config.vggt_total_budget)
+        )
+        if self.vggt_total_budget <= 0:
+            raise ValueError(
+                "VGGT_TOTAL_BUDGET must be a positive integer, got "
+                f"{self.vggt_total_budget}"
+            )
         self.vggt_importance_weights_path = config.vggt_importance_weights_path
         self.vggt_budget_proportions_path = config.vggt_budget_proportions_path
         self.vln_segment_transition_weights_path = os.environ.get(
@@ -219,6 +226,7 @@ class VGGTEncoder(BaseGeometryEncoder):
             compute_instruction_segment_relevance,
             compute_local_transition_score,
             compute_transition_anchor,
+            compute_candidate_final_score,
             concat_metadata,
             gather_metadata,
         )
@@ -338,7 +346,11 @@ class VGGTEncoder(BaseGeometryEncoder):
             # trimmed right/bottom border patches inherit their nearest merged token.
             return x.reshape(-1).index_select(0, expand_index)
 
-        score_dtype = torch.float16
+        # Cache raw components in fp32 because cache-wide z-score normalization happens
+        # later, immediately before topk. The realised language-relevance spread is only
+        # ~1e-2; fp16 storage would collapse many distinct tokens into ties before the
+        # normalization step and the lost ordering cannot be recovered.
+        score_dtype = torch.float32
         boost = float((self.vggt_importance_weights or {}).get("special_token_boost", 0.3))
         eps = float((self.vggt_importance_weights or {}).get("special_token_tiebreak_eps", 1e-6))
         patch_final = expand(merged_final)
@@ -399,6 +411,26 @@ class VGGTEncoder(BaseGeometryEncoder):
                     f"{candidate_meta.final_score.numel()}"
                 )
             layer_budget = int(self._vln_layer_budgets[layer_idx])
+            candidate_meta.final_score, normalized_components = compute_candidate_final_score(
+                candidate_meta,
+                score_weights,
+                special_token_boost=boost,
+            )
+            candidate_component_std = candidate_variance_share = None
+            if (
+                probe is not None
+                and probe.should_log(current_frame_id)
+                and layer_idx in probe.layers
+            ):
+                component_names = ("geometry", "confidence", "instruction", "transition")
+                candidate_component_std = torch.stack([
+                    normalized_components[name].std(unbiased=False) for name in component_names
+                ])
+                weighted_variance = torch.stack([
+                    (float(score_weights[name]) * candidate_component_std[idx]).square()
+                    for idx, name in enumerate(component_names)
+                ])
+                candidate_variance_share = weighted_variance / weighted_variance.sum().clamp_min(1e-12)
             if key.shape[2] > layer_budget:
                 # Only pay for the gather when the layer is actually over budget: a
                 # full-cache index_select moves ~2 * 2048 * T bytes per layer and is a
@@ -414,7 +446,14 @@ class VGGTEncoder(BaseGeometryEncoder):
                     raise AssertionError(f"layer {layer_idx} exceeded its cache budget")
             self._vln_metadata_per_layer[layer_idx] = candidate_meta
             if probe is not None:
-                probe.log_layer_retention(current_frame_id, layer_idx, candidate_meta, layer_budget)
+                probe.log_layer_retention(
+                    current_frame_id,
+                    layer_idx,
+                    candidate_meta,
+                    layer_budget,
+                    candidate_component_std=candidate_component_std,
+                    candidate_variance_share=candidate_variance_share,
+                )
         # Keep the descriptor fp32 and already L2-normalised: casting it to the visual
         # dtype only to cast it back (and re-normalise) next frame loses precision on a
         # cosine that consecutive VLN frames drive to within ~1e-3 of each other.
@@ -513,6 +552,11 @@ class VGGTEncoder(BaseGeometryEncoder):
         confidence = config.get("confidence", {})
         if confidence.get("merge") != "min":
             raise ValueError(f"{path}: confidence.merge must be 'min'")
+        normalization = config.get("normalization", {})
+        if normalization.get("candidate_terms") != "zscore":
+            raise ValueError(
+                f"{path}: normalization.candidate_terms must be 'zscore'"
+            )
         transition = config.get("transition", {})
         window = transition.get("recent_window_size")
         if not isinstance(window, int) or window < 1:

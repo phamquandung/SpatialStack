@@ -19,16 +19,19 @@ fi
 CHECKPOINT="${CHECKPOINT:-/media/vmo-perception/disk_2/vinhld8/checkpoints/spatialstack_janus_vln_train-gate-scale}"
 GEOMETRY_ENCODER_PATH="${GEOMETRY_ENCODER_PATH:-/media/vmo-perception/disk_2/vinhld8/checkpoints/VGGT-1B}"
 SCENE_IDS="${SCENE_IDS:-a}"
-OUTPUT_PATH="${OUTPUT_PATH:-evaluation_gate_scale_fix_eval/scene_segment_transition_ghost/}"
 CONFIG="${CONFIG:-config/vln_r2r.yaml}"
 EVAL_SPLIT="${EVAL_SPLIT:-val_unseen}"
 SAVE_VIDEO="${SAVE_VIDEO:-1}"
 VLN_SEGMENT_TRANSITION_WEIGHTS_PATH="${VLN_SEGMENT_TRANSITION_WEIGHTS_PATH:-configs/vln_segment_transition_weights.json}"
+VGGT_TOTAL_BUDGET="${VGGT_TOTAL_BUDGET:-1200000}"
+MAX_STEPS="${MAX_STEPS:-400}"
+OUTPUT_PATH="${OUTPUT_PATH:-evaluation_gate_scale_fix_eval/scene_segment_transition_zscore_fp32/budget_${VGGT_TOTAL_BUDGET}_steps_${MAX_STEPS}/}"
 
 # Enable the original GHOST cache workflow with the additive VLN scoring proposal.
 export USE_GHOST_KV_CACHE="${USE_GHOST_KV_CACHE:-1}"
 export GHOST_SCORE_MODE="${GHOST_SCORE_MODE:-vln_segment_transition}"
 export VLN_SEGMENT_TRANSITION_WEIGHTS_PATH
+export VGGT_TOTAL_BUDGET
 export VGGT_KV_START="${VGGT_KV_START:-8}"
 export VGGT_KV_RECENT="${VGGT_KV_RECENT:-56}"
 export VLN_ORACLE_STOP="${VLN_ORACLE_STOP:-0}"
@@ -43,6 +46,8 @@ echo "NPROC_PER_NODE: ${NPROC_PER_NODE}"
 echo "USE_GHOST_KV_CACHE: ${USE_GHOST_KV_CACHE}"
 echo "GHOST_SCORE_MODE: ${GHOST_SCORE_MODE}"
 echo "VLN_SEGMENT_TRANSITION_WEIGHTS_PATH: ${VLN_SEGMENT_TRANSITION_WEIGHTS_PATH}"
+echo "VGGT_TOTAL_BUDGET: ${VGGT_TOTAL_BUDGET}"
+echo "MAX_STEPS: ${MAX_STEPS}"
 echo "VGGT_KV: start=${VGGT_KV_START} recent=${VGGT_KV_RECENT}"
 echo "VLN_ORACLE_STOP: ${VLN_ORACLE_STOP}"
 
@@ -60,4 +65,5 @@ torchrun --nproc_per_node="${NPROC_PER_NODE}" --master_port="${MASTER_PORT}" src
   --eval_split "${EVAL_SPLIT}" \
   --scene_ids "${SCENE_IDS}" \
   --output_path "${OUTPUT_PATH}" \
+  --max_steps "${MAX_STEPS}" \
   "${extra_args[@]}"

@@ -13,6 +13,9 @@
   "confidence": {
     "merge": "min"
   },
+  "normalization": {
+    "candidate_terms": "zscore"
+  },
   "transition": {
     "recent_window_size": 4,
     "confidence_gate_weight": 0.50,

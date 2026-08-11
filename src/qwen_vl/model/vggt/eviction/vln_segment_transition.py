@@ -55,6 +55,52 @@ class VLNGhostTokenMetadata:
     best_segment_id: Optional[torch.Tensor] = None
 
 
+@torch.no_grad()
+def zscore_normalize(scores: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
+    """Standardize scores without amplifying a constant or numerically dead term."""
+    values = scores.float()
+    if values.numel() == 0:
+        raise ValueError("cannot z-score an empty score tensor")
+    centered = values - values.mean()
+    scale = centered.square().mean().sqrt()
+    normalized = centered / scale.clamp_min(eps)
+    return normalized * (scale > eps).to(normalized.dtype)
+
+
+@torch.no_grad()
+def compute_candidate_final_score(
+    metadata: VLNGhostTokenMetadata,
+    score_weights,
+    special_token_boost: float,
+) -> Tuple[torch.Tensor, dict]:
+    """Combine cache-wide standardized components for the eviction decision.
+
+    Normalization happens over exactly the patch-token population considered by
+    ``topk``. This removes the realised-scale mismatch between confidence, language
+    relevance, geometry, and transition while preserving every component's ordering
+    across both frames and tokens. Special tokens are scored above the best patch and
+    therefore retain their explicit GHOST privilege.
+    """
+    patch_mask = ~metadata.is_special.bool()
+    components = {
+        "geometry": metadata.geometry_score,
+        "confidence": metadata.confidence_score,
+        "instruction": metadata.instruction_score,
+        "transition": metadata.transition_score,
+    }
+    patch_final = torch.zeros_like(metadata.final_score[patch_mask], dtype=torch.float32)
+    normalized_components = {
+        name: zscore_normalize(values[patch_mask]) for name, values in components.items()
+    }
+    for name, values in normalized_components.items():
+        patch_final.add_(values, alpha=float(score_weights[name]))
+
+    final = torch.empty_like(metadata.final_score, dtype=torch.float32)
+    final[patch_mask] = patch_final
+    final[~patch_mask] = patch_final.max() + float(special_token_boost)
+    return final, normalized_components
+
+
 def split_instruction_with_spans(instruction: str) -> List[Tuple[int, int]]:
     """Return ordered action/clause spans while preserving every non-space character."""
     if not instruction or not instruction.strip():

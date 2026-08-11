@@ -124,6 +124,7 @@ class VLNScoreProbe:
                 transition_scalar.float().reshape(()),
                 stack.mean(dim=1)[3],
                 stack.std(dim=1)[3],
+                stack.std(dim=1)[0],  # confidence std
                 stack.std(dim=1)[1],  # instruction std
                 stack.std(dim=1)[2],  # anchor std
             ]
@@ -135,8 +136,8 @@ class VLNScoreProbe:
         packed = torch.cat([quants.reshape(-1), scalars, hist]).cpu().tolist()
         n_q = len(_QUANTILES)
         quant_flat = packed[: n_q * 4]
-        scalar_flat = packed[n_q * 4 : n_q * 4 + 8]
-        hist_flat = packed[n_q * 4 + 8 :]
+        scalar_flat = packed[n_q * 4 : n_q * 4 + 9]
+        hist_flat = packed[n_q * 4 + 9 :]
         names = ("confidence", "instruction", "transition_anchor", "final")
         self._records.append(
             {
@@ -154,8 +155,9 @@ class VLNScoreProbe:
                 "transition_scalar": scalar_flat[3],
                 "final_mean": scalar_flat[4],
                 "final_std": scalar_flat[5],
-                "instruction_std": scalar_flat[6],
-                "anchor_std": scalar_flat[7],
+                "confidence_std": scalar_flat[6],
+                "instruction_std": scalar_flat[7],
+                "anchor_std": scalar_flat[8],
                 "best_segment_hist": {
                     str(i - 1): int(v) for i, v in enumerate(hist_flat) if v > 0
                 },
@@ -169,6 +171,8 @@ class VLNScoreProbe:
         layer_idx: int,
         metadata,
         budget: int,
+        candidate_component_std: Optional[torch.Tensor] = None,
+        candidate_variance_share: Optional[torch.Tensor] = None,
     ) -> None:
         """Record what survived eviction in ``layer_idx``."""
         if not self.should_log(frame_id) or layer_idx not in self.layers:
@@ -196,9 +200,16 @@ class VLNScoreProbe:
                 age.mean(),
             ]
         )
-        packed = torch.cat([age_q, scalars, seg_hist]).cpu().tolist()
+        diagnostics = torch.cat([
+            candidate_component_std.float(), candidate_variance_share.float()
+        ])
+        packed = torch.cat([age_q, scalars, diagnostics, seg_hist]).cpu().tolist()
         n_q = len(_QUANTILES)
-        age_flat, scalar_flat, seg_flat = packed[:n_q], packed[n_q : n_q + 9], packed[n_q + 9 :]
+        age_flat = packed[:n_q]
+        scalar_flat = packed[n_q : n_q + 9]
+        diagnostic_flat = packed[n_q + 9 : n_q + 17]
+        seg_flat = packed[n_q + 17 :]
+        component_names = ("geometry", "confidence", "instruction", "transition")
         self._records.append(
             {
                 "kind": "layer",
@@ -216,6 +227,12 @@ class VLNScoreProbe:
                 "transition_mean": scalar_flat[6],
                 "instruction_mean": scalar_flat[7],
                 "age_mean": scalar_flat[8],
+                "candidate_component_std": {
+                    name: diagnostic_flat[idx] for idx, name in enumerate(component_names)
+                },
+                "candidate_variance_proxy_share": {
+                    name: diagnostic_flat[idx + 4] for idx, name in enumerate(component_names)
+                },
                 "quantiles": list(_QUANTILES),
                 "age_quantiles": age_flat,
                 "retained_per_segment": {
@@ -248,6 +265,7 @@ def summarize(path: str) -> Dict[str, object]:
         }
         out["within_frame_std"] = {
             "final": _mean(frames, "final_std"),
+            "confidence": _mean(frames, "confidence_std"),
             "instruction": _mean(frames, "instruction_std"),
             "transition_anchor": _mean(frames, "anchor_std"),
         }
@@ -264,6 +282,15 @@ def summarize(path: str) -> Dict[str, object]:
             "age_mean": _mean(layers, "age_mean"),
             "distinct_score_levels": _mean(layers, "distinct_score_levels"),
             "retained_tokens": _mean(layers, "retained_tokens"),
+        }
+        component_names = ("geometry", "confidence", "instruction", "transition")
+        out["candidate_component_std"] = {
+            name: sum(r["candidate_component_std"][name] for r in layers) / len(layers)
+            for name in component_names
+        }
+        out["candidate_variance_proxy_share"] = {
+            name: sum(r["candidate_variance_proxy_share"][name] for r in layers) / len(layers)
+            for name in component_names
         }
     return out
 
