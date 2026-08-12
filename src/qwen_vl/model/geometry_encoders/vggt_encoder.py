@@ -142,6 +142,18 @@ class VGGTEncoder(BaseGeometryEncoder):
                 f"score_mode={self.ghost_score_mode}"
             )
         self._kv_cache_trim = StartRecentKVCache(start_size=_kv_start, recent_size=_kv_recent, k_seq_dim=2, v_seq_dim=2)
+        # Camera-head KV window, in frames. `trunk_fn` appends one token per refinement
+        # iteration per trunk layer every frame, so this cache grew linearly with episode
+        # length (~50 MB at 400 steps) and was the last unbounded CUDA component. Frame 0
+        # is kept because it defines VGGT's reference camera. Set recent<=0 to disable.
+        self._camera_kv_start_frames = int(os.environ.get("VGGT_CAMERA_KV_START", "1"))
+        self._camera_kv_recent_frames = int(os.environ.get("VGGT_CAMERA_KV_RECENT", "64"))
+        self._camera_kv_tokens_per_frame = None
+        if self._camera_kv_recent_frames > 0:
+            print(
+                f"[VGGTEncoder] camera-head KV window: start={self._camera_kv_start_frames} "
+                f"recent={self._camera_kv_recent_frames} frames"
+            )
 
     def set_eval_streaming(self, enabled: bool) -> None:
         self._eval_streaming = bool(enabled)
@@ -163,6 +175,7 @@ class VGGTEncoder(BaseGeometryEncoder):
         self._streaming_importance_cache = None
         self._streaming_frame_metadata = None
         self._streaming_frame_idx = 0
+        self._camera_kv_tokens_per_frame = None
         self._vln_metadata_per_layer = None
         if self._vln_transition_state is not None:
             self._vln_transition_state.reset()
@@ -483,7 +496,13 @@ class VGGTEncoder(BaseGeometryEncoder):
         return index
 
     def _reset_vggt_attention_cache_state(self) -> None:
-        for block in self.vggt.aggregator.global_blocks:
+        blocks = list(self.vggt.aggregator.global_blocks)
+        # The camera trunk also runs with use_cache=True, so it accumulates the same
+        # per-Attention cache state; without this its state leaked across episodes.
+        camera_head = getattr(self.vggt, "camera_head", None)
+        if camera_head is not None:
+            blocks.extend(camera_head.trunk)
+        for block in blocks:
             if hasattr(block.attn, "_reset_cache_state"):
                 block.attn._reset_cache_state()
 
@@ -1080,6 +1099,48 @@ class VGGTEncoder(BaseGeometryEncoder):
         self._ghost_heads_ready = True
         self._depth_head_ready = True
 
+    def _trim_camera_kv(self) -> None:
+        """Bound the camera-head KV to a start+recent window of frames.
+
+        `CameraHead.trunk_fn` appends one token per refinement iteration per trunk layer
+        on every frame (4 x 4 at VGGT's defaults), and nothing ever pruned it: the cache
+        grew linearly with episode length to ~50 MB at 400 steps, the last CUDA component
+        still growing. Only the current and previous pose are ever consumed
+        (`_streaming_frame_metadata` is trimmed to `[-2:]`), and only through the scalar
+        `sigmoid(_pose_change_score(prev, cur).mean())`.
+
+        Token counts are exactly frame-aligned, so slicing cuts on frame boundaries. The
+        per-frame token count is read off the first frame rather than assuming
+        `num_iterations`, so it stays correct if the head's defaults change.
+        """
+        cache = self._streaming_past_key_values_camera
+        if cache is None or self._camera_kv_recent_frames <= 0:
+            return
+        if self._camera_kv_tokens_per_frame is None:
+            first = next((kv for kv in cache if kv is not None), None)
+            if first is None:
+                return
+            # Called right after the first frame's head pass, so this is one frame's worth.
+            self._camera_kv_tokens_per_frame = int(first[0].shape[2])
+            return
+        per_frame = self._camera_kv_tokens_per_frame
+        keep_start = max(0, self._camera_kv_start_frames) * per_frame
+        keep_recent = self._camera_kv_recent_frames * per_frame
+        for idx, kv in enumerate(cache):
+            if kv is None:
+                continue
+            key, value = kv
+            n = key.shape[2]
+            if n <= keep_start + keep_recent:
+                continue
+            if keep_start > 0:
+                key = torch.cat([key[:, :, :keep_start, :], key[:, :, n - keep_recent:, :]], dim=2)
+                value = torch.cat([value[:, :, :keep_start, :], value[:, :, n - keep_recent:, :]], dim=2)
+            else:
+                key = key[:, :, n - keep_recent:, :].contiguous()
+                value = value[:, :, n - keep_recent:, :].contiguous()
+            cache[idx] = [key, value]
+
     def _append_ghost_frame_metadata(
         self,
         aggregated_tokens_list: List[torch.Tensor],
@@ -1092,6 +1153,7 @@ class VGGTEncoder(BaseGeometryEncoder):
             use_cache=True,
         )
         camera_pose = pose_enc[-1][:, 0, :]
+        self._trim_camera_kv()
 
         depth, depth_conf = self.vggt.depth_head(
             aggregated_tokens_list,

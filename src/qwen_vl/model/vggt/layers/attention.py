@@ -110,8 +110,9 @@ class Attention(nn.Module):
                 past_sims.append(float("nan"))
                 continue
             k_patch = k_block[:, :, ps:, :]
-            kn = F.normalize(k_patch, dim=-1)
-            cos = (kn * q_mean).sum(dim=-1)
+            # Cached K is bf16; this diagnostic reports a cosine to 6 decimals.
+            kn = F.normalize(k_patch.float(), dim=-1)
+            cos = (kn * q_mean.float()).sum(dim=-1)
             past_sims.append(float(cos.mean().detach().cpu()))
         motivation_kv_probe.setdefault("records", []).append(
             {"past_frame_idx": T, "layer_idx": int(layer_idx), "past_frame_sims": past_sims}
@@ -961,7 +962,11 @@ class Attention(nn.Module):
         keep_ratio = max(0.05, min(1.0, keep_ratio))
         keep_tokens = max(1, int(round(min_tokens * keep_ratio)))
 
-        delta = (past_k[:, :, :min_tokens, :] - prev_k[:, :, :min_tokens, :].to(past_k.dtype)).abs().mean(dim=(0, 1, 3))
+        # fp32: `delta` is ranked by `topk` and the cached K it is built from is bf16, so a
+        # bf16 difference-of-means would tie across large blocks of tokens.
+        delta = (
+            past_k[:, :, :min_tokens, :].float() - prev_k[:, :, :min_tokens, :].float()
+        ).abs().mean(dim=(0, 1, 3))
         top_idx = torch.topk(delta, k=keep_tokens, largest=True).indices.sort().values
         kept_k = self._gather_tokens(past_k[:, :, :min_tokens, :], top_idx)
         kept_v = self._gather_tokens(past_v[:, :, :min_tokens, :], top_idx)
@@ -1153,7 +1158,7 @@ class Attention(nn.Module):
                 final_k = torch.cat([anchor_k, kept_k], dim=2)
                 final_v = torch.cat([anchor_v, kept_v], dim=2)
                 self._last_kept_attn_importance = torch.ones(
-                    n_special, device=k.device, dtype=k.dtype
+                    n_special, device=k.device, dtype=torch.float32
                 )
                 return final_k, final_v, 0.0, None
 
@@ -1166,7 +1171,7 @@ class Attention(nn.Module):
                 final_k = torch.cat([anchor_k, kept_k], dim=2)
                 final_v = torch.cat([anchor_v, kept_v], dim=2)
                 self._last_kept_attn_importance = torch.ones(
-                    n_special, device=k.device, dtype=k.dtype
+                    n_special, device=k.device, dtype=torch.float32
                 )
                 return final_k, final_v, 0.0, None
 
@@ -1176,8 +1181,13 @@ class Attention(nn.Module):
             )
             patch_k = candidate_k[:, :, patch_indices, :].contiguous()
 
+            # Importance scores are ranked by `topk`, so they are pinned to fp32 rather than
+            # following `k.dtype`. K is cached in bf16 (see `forward`); quantizing the scores
+            # to ~8 mantissa bits would produce mass ties and silently hand the GHOST ranking
+            # to `topk`'s arbitrary tiebreak. Only the reweighting multiply into K itself
+            # (`key_importance_on_k` in `forward`) follows `k.dtype`.
             if importance_scores is not None and importance_scores.numel() == n_patch:
-                imp_scores = importance_scores.to(k.device).to(k.dtype)
+                imp_scores = importance_scores.to(k.device).float()
                 if imp_scores.dim() == 1:
                     imp_scores = imp_scores.unsqueeze(0).unsqueeze(0).expand(B, H, -1)
                 scores = imp_scores
@@ -1213,9 +1223,9 @@ class Attention(nn.Module):
 
             final_k = torch.cat([anchor_k, kept_candidate_k], dim=2)
             final_v = torch.cat([anchor_v, kept_candidate_v], dim=2)
-            attn_imp = torch.ones(num_candidates, device=k.device, dtype=k.dtype)
+            attn_imp = torch.ones(num_candidates, device=k.device, dtype=torch.float32)
             if importance_scores is not None and importance_scores.numel() == n_patch:
-                attn_imp[patch_indices_tensor] = importance_scores.to(k.device).to(k.dtype)
+                attn_imp[patch_indices_tensor] = importance_scores.to(k.device).float()
             merged_for_attn = merged_idx[0, 0, :]
             self._last_kept_attn_importance = attn_imp[merged_for_attn]
             # Special token path: importance_scores has n_patch; no simple kept_imp mapping
@@ -1225,7 +1235,7 @@ class Attention(nn.Module):
         # When cache was evicted, importance_scores come from concat(cached_importance, new_frame)
         # so they match num_candidates. No fallback needed.
         if importance_scores is not None and importance_scores.numel() == num_candidates:
-            imp_scores = importance_scores.to(k.device).to(k.dtype)
+            imp_scores = importance_scores.to(k.device).float()
             if imp_scores.dim() == 1:
                 imp_scores = imp_scores.unsqueeze(0).unsqueeze(0).expand(B, H, -1)
             scores = imp_scores
@@ -1251,7 +1261,7 @@ class Attention(nn.Module):
         if importance_scores is not None and importance_scores.numel() == num_candidates:
             idx = top_indices[0, 0, :]
             kept_imp = importance_scores[idx].to(importance_scores.dtype)
-            self._last_kept_attn_importance = kept_imp.to(k.device).to(k.dtype)
+            self._last_kept_attn_importance = kept_imp.to(k.device).float()
         return final_k, final_v, avg_scores, kept_imp
 
     def forward(
@@ -1294,6 +1304,24 @@ class Attention(nn.Module):
         if self.rope is not None:
             q = self.rope(q, pos)
             k = self.rope(k, pos)
+
+        # `qk_norm=True` makes `k_norm` an `nn.LayerNorm`, which autocast promotes to fp32,
+        # so `k` leaves the norm in fp32 while `v` stays bf16. Caching that costs
+        # 4096 + 2048 instead of 2048 + 2048 bytes/token/layer -- a third of the whole KV
+        # cache -- for no benefit: `F.scaled_dot_product_attention` (and `torch.matmul` on
+        # the non-fused path) is on autocast's lower-precision list and downcasts K at use
+        # time anyway, so attention output is bit-identical either way.
+        #
+        # Both halves of the placement are load-bearing:
+        #   - *after* RoPE, not after `k_norm`: `RotaryPositionEmbedding2D` caches cos/sin
+        #     in `tokens.dtype`, so casting earlier would run the rotation in bf16 and add
+        #     a second rounding on top of the one SDPA already applies.
+        #   - *before* the cache `torch.cat` below, not at `new_kv`: `torch.cat`
+        #     type-promotes, so downcasting later would let next frame's cat of a bf16 past
+        #     with an fp32 new key silently promote the whole cache back to fp32.
+        # Outside autocast `k.dtype == v.dtype` already, so this is a no-op there.
+        if k.dtype != v.dtype:
+            k = k.to(v.dtype)
 
         self._last_kept_attn_importance = None
         key_importance_on_k = None
