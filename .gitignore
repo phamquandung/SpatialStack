@@ -22,3 +22,4 @@ evaluation_*/
 habitat*
 !src/habitat_extensions/
 !src/habitat_extensions/task.py
+!scripts/evaluation/
