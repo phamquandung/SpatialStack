@@ -17,8 +17,12 @@ hf_cache/
 /models/
 /vsibench/
 sam_hq_vit_h.pth
+/result_autoresearch_ghost/
+/results.tsv
 evaluation/
 evaluation_*/
 !scripts/evaluation/
-scripts/evaluation/*
 !scripts/evaluation/eval_janus_vln_scene_ghost.sh
+!scripts/evaluation/eval_autoresearch_ghost.sh
+!scripts/evaluation/record_autoresearch_trial.py
+!scripts/evaluation/prepare_autoresearch_trial.py

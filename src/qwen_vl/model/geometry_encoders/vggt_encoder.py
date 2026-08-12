@@ -25,7 +25,13 @@ _DIM_TO_SLICE = {1: _slice1d, 2: _slice2d, 3: _slice3d}
 
 
 class StartRecentKVCache:
-  """Trim VGGT KV cache to start+recent windows (JanusVLN eval)."""
+  """Trim flattened VGGT KV cache to start+recent *frame* windows.
+
+  VGGT stores streaming keys and values as ``[B, H, F*T, D]``, where
+  ``F`` is the number of cached frames and ``T`` is tokens per frame.
+  ``start_size`` and ``recent_size`` are therefore frame counts and must
+  be converted to token offsets before slicing dimension 2.
+  """
 
   def __init__(self, start_size=8, recent_size=48, k_seq_dim=2, v_seq_dim=2):
     self.start_size = start_size
@@ -34,20 +40,36 @@ class StartRecentKVCache:
     self.k_slice = _DIM_TO_SLICE[k_seq_dim]
     self.v_slice = _DIM_TO_SLICE[v_seq_dim]
 
-  def __call__(self, past_key_values):
+  def __call__(self, past_key_values, tokens_per_frame):
     if past_key_values is None:
       return None
+    if tokens_per_frame is None or tokens_per_frame <= 0:
+      raise ValueError(
+        f"tokens_per_frame must be a positive integer, got {tokens_per_frame!r}"
+      )
+
     seq_len = past_key_values[0][0].size(2)
-    if seq_len <= self.cache_size:
+    if seq_len % tokens_per_frame != 0:
+      raise ValueError(
+        "VGGT KV cache length is not divisible by tokens_per_frame: "
+        f"seq_len={seq_len}, tokens_per_frame={tokens_per_frame}. "
+        "StartRecentKVCache can only trim complete frames."
+      )
+
+    num_frames = seq_len // tokens_per_frame
+    if num_frames <= self.cache_size:
       return past_key_values
+
+    start_tokens = self.start_size * tokens_per_frame
+    recent_tokens = self.recent_size * tokens_per_frame
     return [
       [
         torch.cat(
-          [self.k_slice(k, 0, self.start_size), self.k_slice(k, seq_len - self.recent_size, seq_len)],
+          [self.k_slice(k, 0, start_tokens), self.k_slice(k, seq_len - recent_tokens, seq_len)],
           dim=2,
         ),
         torch.cat(
-          [self.v_slice(v, 0, self.start_size), self.v_slice(v, seq_len - self.recent_size, seq_len)],
+          [self.v_slice(v, 0, start_tokens), self.v_slice(v, seq_len - recent_tokens, seq_len)],
           dim=2,
         ),
       ]
@@ -99,7 +121,9 @@ class VGGTEncoder(BaseGeometryEncoder):
             else bool(config.use_ghost_kv_cache)
         )
         self.vggt_total_budget = int(config.vggt_total_budget)
-        self.vggt_importance_weights_path = config.vggt_importance_weights_path
+        self.vggt_importance_weights_path = os.environ.get(
+            "VGGT_IMPORTANCE_WEIGHTS_PATH", config.vggt_importance_weights_path
+        )
         self.vggt_budget_proportions_path = config.vggt_budget_proportions_path
         self.vggt_importance_weights = None
         self._vggt_configs_loaded = False
@@ -109,6 +133,10 @@ class VGGTEncoder(BaseGeometryEncoder):
         print(f"[VGGTEncoder] eval KV-cache window: start={_kv_start} recent={_kv_recent} (total={_kv_start + _kv_recent} frames)")
         if self.use_ghost_kv_cache:
             print(f"[VGGTEncoder] GHOST KV-cache enabled: total_budget={self.vggt_total_budget}")
+            print(
+                "[VGGTEncoder] GHOST importance weights: "
+                f"{self.vggt_importance_weights_path}"
+            )
         self._kv_cache_trim = StartRecentKVCache(start_size=_kv_start, recent_size=_kv_recent, k_seq_dim=2, v_seq_dim=2)
 
     def set_eval_streaming(self, enabled: bool) -> None:
@@ -510,7 +538,11 @@ class VGGTEncoder(BaseGeometryEncoder):
                         patch_start_idx,
                     )
                 else:
-                    self._streaming_past_key_values = self._kv_cache_trim(self._streaming_past_key_values)
+                    tokens_per_frame = patch_start_idx + h_patch * w_patch
+                    self._streaming_past_key_values = self._kv_cache_trim(
+                        self._streaming_past_key_values,
+                        tokens_per_frame=tokens_per_frame,
+                    )
                 self._streaming_frame_idx += 1
 
                 if torch.cuda.is_available():

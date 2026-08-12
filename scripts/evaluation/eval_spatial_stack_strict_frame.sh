@@ -16,10 +16,10 @@ if [ "${NPROC_PER_NODE}" -lt 1 ]; then
   NPROC_PER_NODE=1
 fi
 
-CHECKPOINT="${CHECKPOINT:-/media/vmo-perception/disk_2/vinhld8/checkpoints/spatialstack_janus_vln_train-gate-scale}"
+CHECKPOINT="${CHECKPOINT:-/media/vmo-perception/disk_2/vinhld8/checkpoints/spatialstack_janus_vln_train-frame-strict}"
 GEOMETRY_ENCODER_PATH="${GEOMETRY_ENCODER_PATH:-/media/vmo-perception/disk_2/vinhld8/checkpoints/VGGT-1B}"
-OUTPUT_PATH="${OUTPUT_PATH:-evaluation_gate_scale_fix_eval-test/scene}"
-SCENE_IDS="${SCENE_IDS:-a}"
+SCENE_IDS="${SCENE_IDS:-EU6Fwq7SyZv}"
+OUTPUT_PATH="${OUTPUT_PATH:-evaluation_spatial_stack_strict_frame/scene/${SCENE_IDS}}"
 CONFIG="${CONFIG:-config/vln_r2r.yaml}"
 EVAL_SPLIT="${EVAL_SPLIT:-val_unseen}"
 SAVE_VIDEO="${SAVE_VIDEO:-1}"
@@ -32,12 +32,11 @@ export VLN_ORACLE_STOP="${VLN_ORACLE_STOP:-0}"
 export GEOMETRY_ENCODER_PATH
 
 echo "CHECKPOINT: ${CHECKPOINT}"
-echo "GEOMETRY_ENCODER_PATH: ${GEOMETRY_ENCODER_PATH}"
+echo "SCENE_IDS: ${SCENE_IDS}"
 echo "OUTPUT_PATH: ${OUTPUT_PATH}"
 echo "CONFIG: ${CONFIG}"
 echo "EVAL_SPLIT: ${EVAL_SPLIT}"
 echo "NPROC_PER_NODE: ${NPROC_PER_NODE}"
-echo "SAVE_VIDEO: ${SAVE_VIDEO}"
 echo "VGGT_KV: start=${VGGT_KV_START} recent=${VGGT_KV_RECENT}"
 echo "VLN_ORACLE_STOP: ${VLN_ORACLE_STOP}"
 
@@ -48,7 +47,7 @@ if [ "${SAVE_VIDEO}" = "1" ]; then
   extra_args+=(--save_video)
 fi
 
-torchrun --nproc_per_node="${NPROC_PER_NODE}" --master_port="${MASTER_PORT}" src/evaluation.py \
+torchrun --nproc_per_node="${NPROC_PER_NODE}" --master_port="${MASTER_PORT}" src/evaluation_scene.py \
   --model_path "${CHECKPOINT}" \
   --geometry_encoder_path "${GEOMETRY_ENCODER_PATH}" \
   --habitat_config_path "${CONFIG}" \
