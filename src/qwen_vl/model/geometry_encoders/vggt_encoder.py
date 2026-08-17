@@ -149,6 +149,14 @@ class VGGTEncoder(BaseGeometryEncoder):
         self._camera_kv_start_frames = int(os.environ.get("VGGT_CAMERA_KV_START", "1"))
         self._camera_kv_recent_frames = int(os.environ.get("VGGT_CAMERA_KV_RECENT", "64"))
         self._camera_kv_tokens_per_frame = None
+        # Segment-coverage quota (A2). Reserves this fraction of each layer's patch budget as
+        # an even floor across instruction segments, so a global top-K cannot drop an entire
+        # instruction clause from the cache. None -> fall back to the weights profile, which
+        # defaults to 0.0 (off, scoring unchanged).
+        _quota_env = os.environ.get("VLN_SEGMENT_QUOTA_FRACTION")
+        self._segment_quota_fraction_override = (
+            float(_quota_env) if _quota_env is not None else None
+        )
         if self._camera_kv_recent_frames > 0:
             print(
                 f"[VGGTEncoder] camera-head KV window: start={self._camera_kv_start_frames} "
@@ -413,6 +421,20 @@ class VGGTEncoder(BaseGeometryEncoder):
             self._vln_metadata_per_layer = [None] * depth_layers
         if self._vln_layer_budgets is None:
             raise RuntimeError("VLN layer budgets were not initialized")
+        # Segment-coverage quota (A2): env overrides the weights profile; 0.0 disables it and
+        # leaves the scoring bit-identical to the pre-quota behaviour.
+        quota_fraction = (
+            self._segment_quota_fraction_override
+            if self._segment_quota_fraction_override is not None
+            else float(
+                self.vln_segment_transition_weights.get("segment_quota", {}).get("fraction", 0.0)
+            )
+        )
+        num_segments = int(self._vln_instruction_state.segment_embeddings.shape[0])
+        # Specials are never evicted (they are scored above every patch), so the cache holds
+        # n_special per frame inserted so far. Counting them from the frame index keeps this
+        # exact without a `metadata.is_special.sum()` device sync.
+        n_special_cached = n_special * (current_frame_id + 1)
         for layer_idx, kv in enumerate(self._streaming_past_key_values):
             if kv is None:
                 continue
@@ -428,6 +450,10 @@ class VGGTEncoder(BaseGeometryEncoder):
                 candidate_meta,
                 score_weights,
                 special_token_boost=boost,
+                segment_quota_fraction=quota_fraction,
+                num_segments=num_segments,
+                # Specials are never evictable, so only the patch remainder is quota-able.
+                patch_budget=max(0, layer_budget - n_special_cached),
             )
             candidate_component_std = candidate_variance_share = None
             if (
@@ -587,6 +613,15 @@ class VGGTEncoder(BaseGeometryEncoder):
                 raise ValueError(f"{path}: transition.{name} must be in [0,1]")
         if abs(sum(float(transition[name]) for name in gate_names) - 1.0) > 1e-6:
             raise ValueError(f"{path}: transition gate weights must sum to 1")
+        # Optional: absent means 0.0, i.e. the segment-coverage quota is off and scoring is
+        # unchanged. Values above 1 are rejected because the quota would then reserve more
+        # slots than the patch budget holds.
+        segment_quota = config.get("segment_quota", {})
+        if not isinstance(segment_quota, dict):
+            raise ValueError(f"{path}: segment_quota must be an object")
+        quota_fraction = segment_quota.get("fraction", 0.0)
+        if not isinstance(quota_fraction, (int, float)) or not 0 <= float(quota_fraction) <= 1:
+            raise ValueError(f"{path}: segment_quota.fraction must be in [0,1]")
         
     
     def encode(self, images: torch.Tensor) -> torch.Tensor:

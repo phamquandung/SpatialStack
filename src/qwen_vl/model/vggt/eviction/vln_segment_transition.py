@@ -68,10 +68,51 @@ def zscore_normalize(scores: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
 
 
 @torch.no_grad()
+def _segment_quota_bonus(
+    patch_final: torch.Tensor,
+    segment_ids: torch.Tensor,
+    num_segments: int,
+    quota_per_segment: int,
+) -> torch.Tensor:
+    """Lift the top ``quota_per_segment`` tokens of every instruction segment above the rest.
+
+    A single global ``topk`` gives no guarantee that the surviving cache still covers every
+    instruction segment: it can legitimately drop *all* of segment 3 whenever segments 1 and 2
+    score higher, and an evicted token never returns. This reserves a floor per segment.
+
+    Implemented as an additive bonus rather than a two-stage selection so the caller keeps its
+    single global ``topk``. Because the bonus exceeds the full spread of ``patch_final``, every
+    quota winner outranks every non-winner, so one global ``topk`` reproduces exactly
+    "quota winners first, then the best of the rest" — with no device sync, which a
+    two-stage selection would need in order to count how many slots the quota consumed.
+    """
+    # Rank each token *within its own segment* by descending score, tensor-side throughout.
+    order = torch.argsort(patch_final, descending=True)
+    seg_ordered = segment_ids.index_select(0, order).long().clamp_(0, num_segments - 1)
+    onehot = F.one_hot(seg_ordered, num_segments).to(torch.int32)
+    # cumsum along the ordered axis counts how many tokens of the same segment came before.
+    rank_ordered = (
+        onehot.cumsum(0).gather(1, seg_ordered.unsqueeze(1)).squeeze(1) - 1
+    )
+    # `rank < q` is "top-q of this segment", and a segment holding fewer than q tokens simply
+    # never reaches q -- short segments need no special case, and unused slots fall through to
+    # the global fill.
+    in_quota = torch.zeros_like(rank_ordered, dtype=torch.bool)
+    in_quota[order] = rank_ordered < int(quota_per_segment)
+
+    spread = patch_final.max() - patch_final.min()
+    bonus = spread + 1.0  # stays a tensor: materialising it would cost a sync
+    return patch_final + in_quota.to(patch_final.dtype) * bonus
+
+
+@torch.no_grad()
 def compute_candidate_final_score(
     metadata: VLNGhostTokenMetadata,
     score_weights,
     special_token_boost: float,
+    segment_quota_fraction: float = 0.0,
+    num_segments: Optional[int] = None,
+    patch_budget: Optional[int] = None,
 ) -> Tuple[torch.Tensor, dict]:
     """Combine cache-wide standardized components for the eviction decision.
 
@@ -80,6 +121,11 @@ def compute_candidate_final_score(
     relevance, geometry, and transition while preserving every component's ordering
     across both frames and tokens. Special tokens are scored above the best patch and
     therefore retain their explicit GHOST privilege.
+
+    When ``segment_quota_fraction > 0``, that fraction of ``patch_budget`` is reserved as an
+    even floor across the ``num_segments`` instruction segments before the remainder is
+    allocated globally by score -- see ``_segment_quota_bonus``. Defaults leave this off, so
+    the scoring is unchanged unless a caller opts in.
     """
     patch_mask = ~metadata.is_special.bool()
     components = {
@@ -94,6 +140,30 @@ def compute_candidate_final_score(
     }
     for name, values in normalized_components.items():
         patch_final.add_(values, alpha=float(score_weights[name]))
+
+    # Applied before the special-token floor below, so specials stay strictly above every
+    # patch and keep their GHOST privilege regardless of the quota.
+    if (
+        float(segment_quota_fraction) > 0.0
+        and num_segments is not None
+        and int(num_segments) > 1
+        and patch_budget is not None
+        and int(patch_budget) > 0
+        and metadata.best_segment_id is not None
+        and patch_final.numel() > 0
+    ):
+        # floor(budget * fraction) // S, so q * S <= patch_budget for any fraction <= 1 and the
+        # reserved portion can never overflow the layer budget.
+        quota_per_segment = int(
+            int(patch_budget) * float(segment_quota_fraction)
+        ) // int(num_segments)
+        if quota_per_segment > 0:
+            patch_final = _segment_quota_bonus(
+                patch_final,
+                metadata.best_segment_id[patch_mask],
+                int(num_segments),
+                quota_per_segment,
+            )
 
     final = torch.empty_like(metadata.final_score, dtype=torch.float32)
     final[patch_mask] = patch_final
