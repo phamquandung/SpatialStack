@@ -68,10 +68,17 @@ def zscore_normalize(scores: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
 
 
 @torch.no_grad()
+def sigmoid_normalize(scores: torch.Tensor) -> torch.Tensor:
+    """GHOST's normalization: per-component sigmoid, no centering or scaling."""
+    return torch.sigmoid(scores.float())
+
+
+@torch.no_grad()
 def compute_candidate_final_score(
     metadata: VLNGhostTokenMetadata,
     score_weights,
     special_token_boost: float,
+    normalization: str = "zscore",
 ) -> Tuple[torch.Tensor, dict]:
     """Combine cache-wide standardized components for the eviction decision.
 
@@ -88,12 +95,23 @@ def compute_candidate_final_score(
         "instruction": metadata.instruction_score,
         "transition": metadata.transition_score,
     }
+    if "recency" in score_weights:
+        # Absolute recency. `transition` freezes a frame's novelty at insertion time and
+        # never revisits it, so nothing else in the score knows how old a token is. Any
+        # affine reparameterisation ((t+1)/N, age, ...) is identical after z-scoring, so
+        # the raw frame index is used and the term carries no hyperparameter. Added only
+        # when declared, so configs without it neither pay for the extra standardization
+        # nor gain a component in the diagnostics.
+        components["recency"] = metadata.frame_id
     patch_final = torch.zeros_like(metadata.final_score[patch_mask], dtype=torch.float32)
+    norm_fn = zscore_normalize if normalization == "zscore" else sigmoid_normalize
     normalized_components = {
-        name: zscore_normalize(values[patch_mask]) for name, values in components.items()
+        name: norm_fn(values[patch_mask]) for name, values in components.items()
     }
     for name, values in normalized_components.items():
         patch_final.add_(values, alpha=float(score_weights[name]))
+    if normalization == "sigmoid":
+        patch_final = patch_final / (patch_final.max() + 1e-8)
 
     final = torch.empty_like(metadata.final_score, dtype=torch.float32)
     final[patch_mask] = patch_final

@@ -428,6 +428,7 @@ class VGGTEncoder(BaseGeometryEncoder):
                 candidate_meta,
                 score_weights,
                 special_token_boost=boost,
+                normalization=self.vln_segment_transition_weights["normalization"]["candidate_terms"],
             )
             candidate_component_std = candidate_variance_share = None
             if (
@@ -435,7 +436,7 @@ class VGGTEncoder(BaseGeometryEncoder):
                 and probe.should_log(current_frame_id)
                 and layer_idx in probe.layers
             ):
-                component_names = ("geometry", "confidence", "instruction", "transition")
+                component_names = tuple(normalized_components)
                 candidate_component_std = torch.stack([
                     normalized_components[name].std(unbiased=False) for name in component_names
                 ])
@@ -558,10 +559,22 @@ class VGGTEncoder(BaseGeometryEncoder):
             "score_weights": ("geometry", "confidence", "instruction", "transition"),
             "geometry_weights": ("camera_pose_change", "depth_structure"),
         }
+        # Optional per section: absent means the term is off, so configs predating a
+        # component stay valid, but a declared weight still counts toward the sum.
+        optional = {"score_weights": ("recency",)}
         for section, names in required.items():
             values = config.get(section)
             if not isinstance(values, dict):
                 raise ValueError(f"{path}: missing object {section!r}")
+            names = names + tuple(
+                n for n in optional.get(section, ()) if n in values
+            )
+            unknown = set(values) - set(names)
+            if unknown:
+                raise ValueError(
+                    f"{path}: unknown {section} entries {sorted(unknown)}; "
+                    f"a misspelled weight would silently be ignored"
+                )
             for name in names:
                 value = values.get(name)
                 if not isinstance(value, (int, float)) or not 0 <= float(value) <= 1:
@@ -572,9 +585,9 @@ class VGGTEncoder(BaseGeometryEncoder):
         if confidence.get("merge") != "min":
             raise ValueError(f"{path}: confidence.merge must be 'min'")
         normalization = config.get("normalization", {})
-        if normalization.get("candidate_terms") != "zscore":
+        if normalization.get("candidate_terms") not in ("zscore", "sigmoid"):
             raise ValueError(
-                f"{path}: normalization.candidate_terms must be 'zscore'"
+                f"{path}: normalization.candidate_terms must be 'zscore' or 'sigmoid'"
             )
         transition = config.get("transition", {})
         window = transition.get("recent_window_size")

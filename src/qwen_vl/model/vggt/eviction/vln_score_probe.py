@@ -24,6 +24,9 @@ import torch
 
 _QUANTILES = (0.0, 0.01, 0.05, 0.25, 0.5, 0.75, 0.95, 0.99, 1.0)
 
+# Must match the key order of `components` in compute_candidate_final_score.
+_COMPONENT_NAMES = ("geometry", "confidence", "instruction", "transition", "recency")
+
 # The probe for the episode currently being recorded, flushed once at interpreter exit
 # so the final episode is not lost (earlier episodes flush when the next one starts).
 _ACTIVE_PROBE: "Optional[VLNScoreProbe]" = None
@@ -207,9 +210,12 @@ class VLNScoreProbe:
         n_q = len(_QUANTILES)
         age_flat = packed[:n_q]
         scalar_flat = packed[n_q : n_q + 9]
-        diagnostic_flat = packed[n_q + 9 : n_q + 17]
-        seg_flat = packed[n_q + 17 :]
-        component_names = ("geometry", "confidence", "instruction", "transition")
+        n_comp = candidate_component_std.numel()
+        diagnostic_flat = packed[n_q + 9 : n_q + 9 + 2 * n_comp]
+        seg_flat = packed[n_q + 9 + 2 * n_comp :]
+        # Derived from the tensor the scorer handed over, so adding a score component
+        # does not silently shift the seg-histogram slice by one.
+        component_names = _COMPONENT_NAMES[:n_comp]
         self._records.append(
             {
                 "kind": "layer",
@@ -231,7 +237,7 @@ class VLNScoreProbe:
                     name: diagnostic_flat[idx] for idx, name in enumerate(component_names)
                 },
                 "candidate_variance_proxy_share": {
-                    name: diagnostic_flat[idx + 4] for idx, name in enumerate(component_names)
+                    name: diagnostic_flat[idx + n_comp] for idx, name in enumerate(component_names)
                 },
                 "quantiles": list(_QUANTILES),
                 "age_quantiles": age_flat,
@@ -283,7 +289,9 @@ def summarize(path: str) -> Dict[str, object]:
             "distinct_score_levels": _mean(layers, "distinct_score_levels"),
             "retained_tokens": _mean(layers, "retained_tokens"),
         }
-        component_names = ("geometry", "confidence", "instruction", "transition")
+        # Read the component set off the records rather than assuming it: a run with an
+        # extra term would otherwise be summarised as if that term did not exist.
+        component_names = tuple(layers[0]["candidate_component_std"])
         out["candidate_component_std"] = {
             name: sum(r["candidate_component_std"][name] for r in layers) / len(layers)
             for name in component_names

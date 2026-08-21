@@ -16,16 +16,16 @@ if [ "${NPROC_PER_NODE}" -lt 1 ]; then
   NPROC_PER_NODE=1
 fi
 
-CHECKPOINT="${CHECKPOINT:-/media/vmo-perception/disk_2/vinhld8/checkpoints/spatialstack_janus_vln_train-gate-scale}"
-GEOMETRY_ENCODER_PATH="${GEOMETRY_ENCODER_PATH:-/media/vmo-perception/disk_2/vinhld8/checkpoints/VGGT-1B}"
+CHECKPOINT="${CHECKPOINT:-/home/tripnv/SpatialStack/checkpoints/spatialstack_janus_vln_train-gate-scale-4B-loss-3}"
+GEOMETRY_ENCODER_PATH="${GEOMETRY_ENCODER_PATH:-/home/tripnv/SpatialStack/checkpoints/VGGT-1B}"
 SCENE_IDS="${SCENE_IDS:-a}"
-CONFIG="${CONFIG:-config/vln_r2r.yaml}"
+CONFIG="${CONFIG:-config/vln_r2r_local.yaml}"
 EVAL_SPLIT="${EVAL_SPLIT:-val_unseen}"
-SAVE_VIDEO="${SAVE_VIDEO:-1}"
+SAVE_VIDEO="${SAVE_VIDEO:-0}"
 VLN_SEGMENT_TRANSITION_WEIGHTS_PATH="${VLN_SEGMENT_TRANSITION_WEIGHTS_PATH:-configs/vln_segment_transition_weights.json}"
-VGGT_TOTAL_BUDGET="${VGGT_TOTAL_BUDGET:-1200000}"
+VGGT_TOTAL_BUDGET="${VGGT_TOTAL_BUDGET:-900000}"
 MAX_STEPS="${MAX_STEPS:-400}"
-OUTPUT_PATH="${OUTPUT_PATH:-evaluation_gate_scale_fix_eval/scene_segment_transition_zscore_fp32/budget_${VGGT_TOTAL_BUDGET}_steps_${MAX_STEPS}/}"
+OUTPUT_PATH="${OUTPUT_PATH:-/home/tripnv/project/Token_eviction/SpatialStack/ablation/scene_segment_transition_bf16k_uniform/budget_900000_steps_400}"
 
 # Enable the original GHOST cache workflow with the additive VLN scoring proposal.
 export USE_GHOST_KV_CACHE="${USE_GHOST_KV_CACHE:-1}"
@@ -34,6 +34,14 @@ export VLN_SEGMENT_TRANSITION_WEIGHTS_PATH
 export VGGT_TOTAL_BUDGET
 export VGGT_KV_START="${VGGT_KV_START:-8}"
 export VGGT_KV_RECENT="${VGGT_KV_RECENT:-56}"
+VLN_SCORE_PROBE="${VLN_SCORE_PROBE:-0}"
+VLN_SCORE_PROBE_DIR="${VLN_SCORE_PROBE_DIR:-${OUTPUT_PATH}/probe}"
+VLN_SCORE_PROBE_EVERY="${VLN_SCORE_PROBE_EVERY:-10}"
+VLN_SCORE_PROBE_LAYERS="${VLN_SCORE_PROBE_LAYERS:-0,11,23}"
+export VLN_SCORE_PROBE
+export VLN_SCORE_PROBE_DIR
+export VLN_SCORE_PROBE_EVERY
+export VLN_SCORE_PROBE_LAYERS
 export VLN_ORACLE_STOP="${VLN_ORACLE_STOP:-0}"
 export GEOMETRY_ENCODER_PATH
 
@@ -50,6 +58,10 @@ echo "VGGT_TOTAL_BUDGET: ${VGGT_TOTAL_BUDGET}"
 echo "MAX_STEPS: ${MAX_STEPS}"
 echo "VGGT_KV: start=${VGGT_KV_START} recent=${VGGT_KV_RECENT}"
 echo "VLN_ORACLE_STOP: ${VLN_ORACLE_STOP}"
+echo "VLN_SCORE_PROBE: ${VLN_SCORE_PROBE}"
+echo "VLN_SCORE_PROBE_DIR: ${VLN_SCORE_PROBE_DIR}"
+echo "VLN_SCORE_PROBE_EVERY: ${VLN_SCORE_PROBE_EVERY}"
+echo "VLN_SCORE_PROBE_LAYERS: ${VLN_SCORE_PROBE_LAYERS}"
 
 mkdir -p "${OUTPUT_PATH}"
 

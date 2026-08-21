@@ -19,6 +19,12 @@ RESOURCE_METRICS = (
     "peak_reserved_mb",
     "peak_vggt_kv_mb",
 )
+TIMING_METRICS = (
+    "mean_step_ms",
+    "mean_vggt_ms",
+    "episode_time_s",
+)
+OPTIONAL_METRICS = RESOURCE_METRICS + TIMING_METRICS
 
 
 def parse_args() -> argparse.Namespace:
@@ -105,7 +111,7 @@ def load_episode_rows(
 
             normalized = dict(row)
             normalized.update(metric_values)
-            for name in RESOURCE_METRICS:
+            for name in OPTIONAL_METRICS:
                 if name not in row:
                     continue
                 try:
@@ -243,6 +249,102 @@ def format_resource_table(rows: Sequence[Mapping[str, object]]) -> str:
     return "\n".join([render(headers), separator, *(render(row) for row in output_rows)])
 
 
+def _has_step_weights(rows: Sequence[Mapping[str, object]]) -> bool:
+    """True when every row carries a positive step count usable as a weight."""
+    return all("steps" in row and float(row["steps"]) > 0 for row in rows)
+
+
+def _mean_per_step(
+    rows: Sequence[Mapping[str, object]], field: str, step_weighted: bool
+) -> float | None:
+    """Mean of a per-episode average.
+
+    ``mean_step_ms``/``mean_vggt_ms`` are already averaged *within* an episode, so a
+    plain mean over episodes would weight a 27-step episode the same as a 54-step one.
+    Weighting by step count recovers the true per-step latency.
+    """
+    present = [row for row in rows if field in row]
+    if not present or len(present) != len(rows):
+        return None
+    if not step_weighted:
+        return sum(float(row[field]) for row in present) / len(present)
+    total = sum(float(row["steps"]) for row in present)
+    if total <= 0:
+        return None
+    return sum(float(row[field]) * float(row["steps"]) for row in present) / total
+
+
+def _sum_field(rows: Sequence[Mapping[str, object]], field: str) -> float | None:
+    present = [row for row in rows if field in row]
+    if not present or len(present) != len(rows):
+        return None
+    return sum(float(row[field]) for row in present)
+
+
+def format_timing_table(rows: Sequence[Mapping[str, object]]) -> Tuple[str, bool]:
+    """Per-scene and overall step latency, VGGT share, and control frequency."""
+    grouped: Dict[str, List[Mapping[str, object]]] = defaultdict(list)
+    for row in rows:
+        grouped[str(row["scene_id"])].append(row)
+
+    step_weighted = _has_step_weights(rows)
+
+    def summarize(scene_rows: Sequence[Mapping[str, object]]) -> Tuple[str, ...]:
+        steps = _sum_field(scene_rows, "steps")
+        step_ms = _mean_per_step(scene_rows, "mean_step_ms", step_weighted)
+        vggt_ms = _mean_per_step(scene_rows, "mean_vggt_ms", step_weighted)
+        wall_s = _sum_field(scene_rows, "episode_time_s")
+        episode_s = None if wall_s is None else wall_s / len(scene_rows)
+        share = (
+            f"{100.0 * vggt_ms / step_ms:.1f}"
+            if step_ms and vggt_ms is not None and step_ms > 0
+            else "n/a"
+        )
+        hz = f"{1000.0 / step_ms:.2f}" if step_ms and step_ms > 0 else "n/a"
+        return (
+            "n/a" if steps is None else f"{steps:.0f}",
+            "n/a" if step_ms is None else f"{step_ms:.1f}",
+            "n/a" if vggt_ms is None else f"{vggt_ms:.1f}",
+            share,
+            hz,
+            "n/a" if episode_s is None else f"{episode_s:.1f}",
+            "n/a" if wall_s is None else f"{wall_s:.1f}",
+        )
+
+    output_rows = [
+        (scene_id, str(len(grouped[scene_id])), *summarize(grouped[scene_id]))
+        for scene_id in sorted(grouped)
+    ]
+    output_rows.append(("OVERALL", str(len(rows)), *summarize(rows)))
+
+    headers = (
+        "Scene",
+        "Episodes",
+        "Steps",
+        "Step ms",
+        "VGGT ms",
+        "VGGT %",
+        "Ctrl Hz",
+        "Episode s",
+        "Wall s",
+    )
+    widths = [
+        max(len(headers[index]), *(len(row[index]) for row in output_rows))
+        for index in range(len(headers))
+    ]
+
+    def render(values: Iterable[str]) -> str:
+        values = tuple(values)
+        return "  ".join(
+            value.ljust(widths[index]) if index == 0 else value.rjust(widths[index])
+            for index, value in enumerate(values)
+        )
+
+    separator = "  ".join("-" * width for width in widths)
+    table = "\n".join([render(headers), separator, *(render(row) for row in output_rows)])
+    return table, step_weighted
+
+
 def format_memory_summary(rows: Sequence[Mapping[str, object]]) -> str:
     """Render the overall episode-level peak-memory mean and maximum."""
     metrics = (
@@ -274,6 +376,14 @@ def main() -> int:
         return 2
 
     print(format_table(rows))
+    timing_table, step_weighted = format_timing_table(rows)
+    weighting = (
+        "step-weighted, so scenes with longer episodes count proportionally"
+        if step_weighted
+        else "episode-weighted fallback: some rows have no usable step count"
+    )
+    print(f"\nStep timing ({weighting}):")
+    print(timing_table)
     print("\nEpisode-level efficiency metrics (mean within each scene):")
     print(format_resource_table(rows))
     print("\nOverall memory metrics (episode-level peaks):")
