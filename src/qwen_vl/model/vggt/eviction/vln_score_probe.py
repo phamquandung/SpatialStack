@@ -119,17 +119,30 @@ class VLNScoreProbe:
             [confidence.float(), instruction.float(), anchor.float(), final.float()]
         )  # [4, n_tokens]
         quants = torch.quantile(stack, qs, dim=1)  # [n_q, 4]
+        # geometry/depth_structure are frame scalars under depth_mode=frame_var but
+        # per-token vectors under token_grad, so reduce rather than reshape, and record
+        # the within-frame spread: that spread is exactly what token_grad is meant to
+        # create and what frame_var cannot have.
+        def _mean(x):
+            return x.float().mean()
+
+        def _spread(x):
+            x = x.float()
+            return x.std(unbiased=False) if x.numel() > 1 else torch.zeros((), device=x.device)
+
         scalars = torch.stack(
             [
-                geometry.float().reshape(()),
-                camera.float().reshape(()),
-                depth_structure.float().reshape(()),
+                _mean(geometry),
+                _mean(camera),
+                _mean(depth_structure),
                 transition_scalar.float().reshape(()),
                 stack.mean(dim=1)[3],
                 stack.std(dim=1)[3],
                 stack.std(dim=1)[0],  # confidence std
                 stack.std(dim=1)[1],  # instruction std
                 stack.std(dim=1)[2],  # anchor std
+                _spread(geometry),
+                _spread(depth_structure),
             ]
         )
         hist = torch.bincount(
@@ -139,8 +152,8 @@ class VLNScoreProbe:
         packed = torch.cat([quants.reshape(-1), scalars, hist]).cpu().tolist()
         n_q = len(_QUANTILES)
         quant_flat = packed[: n_q * 4]
-        scalar_flat = packed[n_q * 4 : n_q * 4 + 9]
-        hist_flat = packed[n_q * 4 + 9 :]
+        scalar_flat = packed[n_q * 4 : n_q * 4 + 11]
+        hist_flat = packed[n_q * 4 + 11 :]
         names = ("confidence", "instruction", "transition_anchor", "final")
         self._records.append(
             {
@@ -161,6 +174,8 @@ class VLNScoreProbe:
                 "confidence_std": scalar_flat[6],
                 "instruction_std": scalar_flat[7],
                 "anchor_std": scalar_flat[8],
+                "geometry_std": scalar_flat[9],
+                "depth_structure_std": scalar_flat[10],
                 "best_segment_hist": {
                     str(i - 1): int(v) for i, v in enumerate(hist_flat) if v > 0
                 },
@@ -176,6 +191,8 @@ class VLNScoreProbe:
         budget: int,
         candidate_component_std: Optional[torch.Tensor] = None,
         candidate_variance_share: Optional[torch.Tensor] = None,
+        candidate_true_share: Optional[torch.Tensor] = None,
+        candidate_component_corr: Optional[torch.Tensor] = None,
     ) -> None:
         """Record what survived eviction in ``layer_idx``."""
         if not self.should_log(frame_id) or layer_idx not in self.layers:
@@ -203,8 +220,16 @@ class VLNScoreProbe:
                 age.mean(),
             ]
         )
+        n_comp_t = candidate_component_std.numel()
         diagnostics = torch.cat([
-            candidate_component_std.float(), candidate_variance_share.float()
+            candidate_component_std.float(),
+            candidate_variance_share.float(),
+            candidate_true_share.float()
+            if candidate_true_share is not None
+            else torch.zeros(n_comp_t, device=device),
+            candidate_component_corr.float().reshape(-1)
+            if candidate_component_corr is not None
+            else torch.zeros(n_comp_t * n_comp_t, device=device),
         ])
         packed = torch.cat([age_q, scalars, diagnostics, seg_hist]).cpu().tolist()
         n_q = len(_QUANTILES)
@@ -212,7 +237,10 @@ class VLNScoreProbe:
         scalar_flat = packed[n_q : n_q + 9]
         n_comp = candidate_component_std.numel()
         diagnostic_flat = packed[n_q + 9 : n_q + 9 + 2 * n_comp]
-        seg_flat = packed[n_q + 9 + 2 * n_comp :]
+        true_share_flat = packed[n_q + 9 + 2 * n_comp : n_q + 9 + 3 * n_comp]
+        corr_end = n_q + 9 + 3 * n_comp + n_comp * n_comp
+        corr_flat = packed[n_q + 9 + 3 * n_comp : corr_end]
+        seg_flat = packed[corr_end:]
         # Derived from the tensor the scorer handed over, so adding a score component
         # does not silently shift the seg-histogram slice by one.
         component_names = _COMPONENT_NAMES[:n_comp]
@@ -238,6 +266,17 @@ class VLNScoreProbe:
                 },
                 "candidate_variance_proxy_share": {
                     name: diagnostic_flat[idx + n_comp] for idx, name in enumerate(component_names)
+                },
+                # Covariance-aware: Var(S) = sum_i Cov(w_i z_i, S). Sums to 1; a component
+                # that fights the others goes negative, which the proxy share cannot show.
+                "candidate_variance_true_share": {
+                    name: true_share_flat[idx] for idx, name in enumerate(component_names)
+                },
+                "candidate_component_corr": {
+                    f"{a}|{b}": corr_flat[i * n_comp + j]
+                    for i, a in enumerate(component_names)
+                    for j, b in enumerate(component_names)
+                    if j > i
                 },
                 "quantiles": list(_QUANTILES),
                 "age_quantiles": age_flat,

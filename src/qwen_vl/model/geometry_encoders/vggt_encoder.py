@@ -24,6 +24,11 @@ def _slice3d(x, start, end):
 
 _DIM_TO_SLICE = {1: _slice1d, 2: _slice2d, 3: _slice3d}
 
+# frame_var      : GHOST's original scalar, var() of the whole depth-gradient map
+# token_grad_avg : per-token, average-pooled  (measured: crushes edges, 0.14% of variance)
+# token_grad_max : per-token, max-pooled      (keeps the discontinuity inside each cell)
+_GEOMETRY_DEPTH_MODES = ("frame_var", "token_grad_avg", "token_grad_max")
+
 
 class StartRecentKVCache:
   """Trim VGGT KV cache to start+recent windows (JanusVLN eval)."""
@@ -323,7 +328,7 @@ class VGGTEncoder(BaseGeometryEncoder):
             )
         camera = torch.sigmoid(camera).clamp(0, 1)
         depth = meta.get("depth")
-        token_depth = self._vln_geometry_depth_mode == "token_grad"
+        token_depth = self._vln_geometry_depth_mode in ("token_grad_avg", "token_grad_max")
         if depth is None:
             # Keep the fallback's rank the same as the live path's so a frame with no
             # depth map does not silently change the component's shape mid-episode.
@@ -348,10 +353,19 @@ class VGGTEncoder(BaseGeometryEncoder):
                 # onto the same aligned grid the other three components live on, so a token
                 # sitting on a depth discontinuity (doorway edge, object boundary) outranks
                 # one in the middle of a flat wall.
+                #
+                # avg vs max matters more than it looks. Each pooling cell covers ~28x28
+                # depth pixels, so averaging spreads a one-pixel-wide discontinuity over
+                # ~780 flat neighbours: measured on real episodes, avg pooling left
+                # pool(|grad|) ~= 0.0047 and only 0.14% of geometry's variance was
+                # within-frame. Max pooling keeps the edge that the cell actually contains.
+                pool = (
+                    F.adaptive_max_pool2d
+                    if self._vln_geometry_depth_mode == "token_grad_max"
+                    else F.adaptive_avg_pool2d
+                )
                 depth_structure = torch.sigmoid(
-                    F.adaptive_avg_pool2d(
-                        magnitude[None, None], (aligned_h, aligned_w)
-                    ).flatten()
+                    pool(magnitude[None, None], (aligned_h, aligned_w)).flatten()
                 )
             else:
                 depth_structure = torch.sigmoid(magnitude.var())
@@ -463,6 +477,7 @@ class VGGTEncoder(BaseGeometryEncoder):
                 normalization=self.vln_segment_transition_weights["normalization"]["candidate_terms"],
             )
             candidate_component_std = candidate_variance_share = None
+            candidate_true_share = candidate_component_corr = None
             if (
                 probe is not None
                 and probe.should_log(current_frame_id)
@@ -476,6 +491,29 @@ class VGGTEncoder(BaseGeometryEncoder):
                     (float(score_weights[name]) * candidate_component_std[idx]).square()
                     for idx, name in enumerate(component_names)
                 ])
+                # The proxy share above assumes the components are independent. They are
+                # not: geometry peaks on depth discontinuities, which is exactly where
+                # VGGT's predicted depth is least confident, so those two can cancel
+                # inside the sum while each still reports a healthy standalone variance.
+                # Var(S) = sum_i Cov(w_i z_i, S) is the decomposition that survives
+                # correlation; it sums to 1 and a component that fights the sum goes
+                # negative.
+                comp_matrix = torch.stack(
+                    [normalized_components[name] for name in component_names]
+                )
+                comp_centered = comp_matrix - comp_matrix.mean(dim=1, keepdim=True)
+                comp_sigma = comp_centered.square().mean(dim=1).sqrt().clamp_min(1e-6)
+                candidate_component_corr = (
+                    comp_centered @ comp_centered.T
+                ) / (comp_matrix.shape[1] * comp_sigma[:, None] * comp_sigma[None, :])
+                w_vec = torch.tensor(
+                    [float(score_weights[name]) for name in component_names],
+                    device=comp_matrix.device, dtype=comp_matrix.dtype,
+                )
+                summed_centered = (w_vec[:, None] * comp_centered).sum(0)
+                candidate_true_share = (
+                    (w_vec[:, None] * comp_centered) * summed_centered
+                ).mean(dim=1) / summed_centered.square().mean().clamp_min(1e-12)
                 candidate_variance_share = weighted_variance / weighted_variance.sum().clamp_min(1e-12)
             if key.shape[2] > layer_budget:
                 # Only pay for the gather when the layer is actually over budget: a
@@ -499,6 +537,8 @@ class VGGTEncoder(BaseGeometryEncoder):
                     layer_budget,
                     candidate_component_std=candidate_component_std,
                     candidate_variance_share=candidate_variance_share,
+                    candidate_true_share=candidate_true_share,
+                    candidate_component_corr=candidate_component_corr,
                 )
         # Keep the descriptor fp32 and already L2-normalised: casting it to the visual
         # dtype only to cast it back (and re-normalise) next frame loses precision on a
@@ -587,10 +627,10 @@ class VGGTEncoder(BaseGeometryEncoder):
                 "VLN_GEOMETRY_DEPTH_MODE",
                 vln_weights.get("geometry", {}).get("depth_mode", "frame_var"),
             ).strip().lower()
-            if self._vln_geometry_depth_mode not in ("frame_var", "token_grad"):
+            if self._vln_geometry_depth_mode not in _GEOMETRY_DEPTH_MODES:
                 raise ValueError(
-                    "geometry.depth_mode must be 'frame_var' or 'token_grad', got "
-                    f"{self._vln_geometry_depth_mode!r}"
+                    f"geometry.depth_mode must be one of {sorted(_GEOMETRY_DEPTH_MODES)}, "
+                    f"got {self._vln_geometry_depth_mode!r}"
                 )
             print(
                 "[VGGTEncoder] geometry depth_mode="
@@ -639,9 +679,9 @@ class VGGTEncoder(BaseGeometryEncoder):
         geometry_cfg = config.get("geometry", {})
         if not isinstance(geometry_cfg, dict):
             raise ValueError(f"{path}: geometry must be an object")
-        if geometry_cfg.get("depth_mode", "frame_var") not in ("frame_var", "token_grad"):
+        if geometry_cfg.get("depth_mode", "frame_var") not in _GEOMETRY_DEPTH_MODES:
             raise ValueError(
-                f"{path}: geometry.depth_mode must be 'frame_var' or 'token_grad'"
+                f"{path}: geometry.depth_mode must be one of {sorted(_GEOMETRY_DEPTH_MODES)}"
             )
         transition = config.get("transition", {})
         window = transition.get("recent_window_size")
