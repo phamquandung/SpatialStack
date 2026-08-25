@@ -113,6 +113,7 @@ class VGGTEncoder(BaseGeometryEncoder):
         self._vln_transition_state = None
         self._vln_metadata_per_layer = None
         self._vln_layer_budgets = None
+        self._vln_geometry_depth_mode = "frame_var"
         self._vln_score_probe = None
         self._vln_expand_index_cache = None
         self.vggt_total_budget = int(
@@ -322,8 +323,14 @@ class VGGTEncoder(BaseGeometryEncoder):
             )
         camera = torch.sigmoid(camera).clamp(0, 1)
         depth = meta.get("depth")
+        token_depth = self._vln_geometry_depth_mode == "token_grad"
         if depth is None:
-            depth_structure = torch.tensor(0.5, device=device)
+            # Keep the fallback's rank the same as the live path's so a frame with no
+            # depth map does not silently change the component's shape mid-episode.
+            depth_structure = (
+                torch.full((visual.shape[0],), 0.5, device=device)
+                if token_depth else torch.tensor(0.5, device=device)
+            )
         else:
             d = depth.to(device).float().squeeze()
             while d.ndim > 2:
@@ -334,7 +341,20 @@ class VGGTEncoder(BaseGeometryEncoder):
             gy = F.pad(
                 (d[1:, :] - d[:-1, :]).unsqueeze(0), (0, 0, 0, 1), mode="replicate"
             ).squeeze(0)
-            depth_structure = torch.sigmoid(torch.sqrt(gx.square() + gy.square()).var())
+            magnitude = torch.sqrt(gx.square() + gy.square())
+            if token_depth:
+                # `magnitude` is already a per-pixel map; collapsing it with .var() throws
+                # away exactly the within-frame signal the eviction ranking needs. Pool it
+                # onto the same aligned grid the other three components live on, so a token
+                # sitting on a depth discontinuity (doorway edge, object boundary) outranks
+                # one in the middle of a flat wall.
+                depth_structure = torch.sigmoid(
+                    F.adaptive_avg_pool2d(
+                        magnitude[None, None], (aligned_h, aligned_w)
+                    ).flatten()
+                )
+            else:
+                depth_structure = torch.sigmoid(magnitude.var())
         geometry_weights = self.vln_segment_transition_weights["geometry_weights"]
         geometry = (
             float(geometry_weights["camera_pose_change"]) * camera
@@ -374,7 +394,12 @@ class VGGTEncoder(BaseGeometryEncoder):
         # INTRA-FRAME rank of the special token. Baking the privilege in here keeps the
         # tiebreak infinitesimal; deriving it in the eviction loop from the token's
         # position in the (growing) cache would scale it with cache size instead.
-        special_final = geometry + boost + eps * torch.arange(
+        # Under token_grad `geometry` is a per-token vector, so collapse it to the frame
+        # scalar this formula expects. (Note this whole tensor is overwritten by
+        # compute_candidate_final_score at prune time; it is kept only so the stored
+        # metadata stays well-formed.)
+        geometry_frame = geometry if geometry.ndim == 0 else geometry.mean()
+        special_final = geometry_frame + boost + eps * torch.arange(
             n_special, device=device, dtype=torch.float32
         )
         # final_score stays fp32: the realised score range is ~1e-2 while the fp16 ulp
@@ -382,7 +407,14 @@ class VGGTEncoder(BaseGeometryEncoder):
         # hand the eviction decision to topk's tiebreak.
         new_meta = VLNGhostTokenMetadata(
             frame_id=frame_ids,
-            geometry_score=geometry.expand(tokens_per_frame).to(score_dtype),
+            geometry_score=(
+                geometry.expand(tokens_per_frame)
+                if geometry.ndim == 0
+                # Token-level geometry follows the same layout as the other three
+                # components: specials are zeroed (they are excluded from the z-score
+                # population anyway) and patch values go through the merge inverse.
+                else torch.cat([zeros_special, expand(geometry)])
+            ).to(score_dtype),
             confidence_score=torch.cat([zeros_special, expand(confidence)]).to(score_dtype),
             instruction_score=torch.cat([zeros_special, expand(relevance)]).to(score_dtype),
             transition_score=torch.cat([zeros_special, expand(anchor)]).to(score_dtype),
@@ -549,6 +581,21 @@ class VGGTEncoder(BaseGeometryEncoder):
                 vln_weights = json.load(f)
             self._validate_vln_segment_transition_weights(vln_weights, vln_weights_path)
             self.vln_segment_transition_weights = vln_weights
+            # Resolved once here rather than per frame: the scorer runs every step and
+            # must stay free of dict/env lookups on its hot path.
+            self._vln_geometry_depth_mode = os.environ.get(
+                "VLN_GEOMETRY_DEPTH_MODE",
+                vln_weights.get("geometry", {}).get("depth_mode", "frame_var"),
+            ).strip().lower()
+            if self._vln_geometry_depth_mode not in ("frame_var", "token_grad"):
+                raise ValueError(
+                    "geometry.depth_mode must be 'frame_var' or 'token_grad', got "
+                    f"{self._vln_geometry_depth_mode!r}"
+                )
+            print(
+                "[VGGTEncoder] geometry depth_mode="
+                f"{self._vln_geometry_depth_mode}"
+            )
         self._vggt_configs_loaded = True
 
     @staticmethod
@@ -588,6 +635,13 @@ class VGGTEncoder(BaseGeometryEncoder):
         if normalization.get("candidate_terms") not in ("zscore", "sigmoid"):
             raise ValueError(
                 f"{path}: normalization.candidate_terms must be 'zscore' or 'sigmoid'"
+            )
+        geometry_cfg = config.get("geometry", {})
+        if not isinstance(geometry_cfg, dict):
+            raise ValueError(f"{path}: geometry must be an object")
+        if geometry_cfg.get("depth_mode", "frame_var") not in ("frame_var", "token_grad"):
+            raise ValueError(
+                f"{path}: geometry.depth_mode must be 'frame_var' or 'token_grad'"
             )
         transition = config.get("transition", {})
         window = transition.get("recent_window_size")
