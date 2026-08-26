@@ -4,7 +4,8 @@
     "geometry": 0.0,
     "confidence": 0.333333333333,
     "instruction": 0.333333333333,
-    "transition": 0.333333333334
+    "transition": 0.333333333334,
+    "recency": 0.0
   },
   "geometry_weights": {
     "camera_pose_change": 0.50,
