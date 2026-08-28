@@ -1,6 +1,6 @@
 import logging
 import os
-from typing import Callable, List, Any, Tuple, Dict, Union
+from typing import Callable, List, Any, Tuple, Dict, Union, Optional
 import warnings
 
 import torch
@@ -10,6 +10,7 @@ from .attention import Attention
 from .drop_path import DropPath
 from .layer_scale import LayerScale
 from .mlp import Mlp
+from .importance_scorer import TokenImportanceScorer
 
 
 XFORMERS_AVAILABLE = False
@@ -35,8 +36,18 @@ class Block(nn.Module):
         qk_norm: bool = False,
         fused_attn: bool = True,  # use F.scaled_dot_product_attention or not
         rope=None,
+        eviction_strategy: str = "repr_shift_spatial",
+        spatial_alpha: float = 0.5,
+        patch_start_idx: int = 5,
+        patch_grid_size: Optional[Tuple[int, int]] = None,
     ) -> None:
         super().__init__()
+        self.eviction_strategy = eviction_strategy
+        self.patch_start_idx = patch_start_idx
+        self.patch_grid_size = patch_grid_size
+        self.importance_scorer = TokenImportanceScorer(
+            strategy=eviction_strategy, spatial_alpha=spatial_alpha
+        )
 
         self.norm1 = norm_layer(dim)
 
@@ -69,7 +80,140 @@ class Block(nn.Module):
 
         self.sample_drop_ratio = drop_path
 
-    def forward(self, x: Tensor, pos=None, attn_mask=None, past_key_values=None, use_cache=False) -> Union[Tensor, Tuple[Tensor, Dict]]:
+    def _forward_ovggt_cache(
+        self,
+        x,
+        pos,
+        past_key_values,
+        cache_budget,
+        prev_importance,
+        intra_frame_keep_ratio,
+        anchor_token_count,
+        importance_weight,
+        window_token_count,
+    ):
+        use_two_stage = intra_frame_keep_ratio < 1.0
+        normed = self.norm1(x)
+
+        if use_two_stage:
+            attn_output, kv_info, scores = self.attn(
+                normed,
+                pos=pos,
+                past_key_values=past_key_values,
+                use_cache=True,
+                kv_cache_mode="ovggt",
+                cache_budget=cache_budget,
+                importance_scores=prev_importance,
+                defer_eviction=True,
+                anchor_token_count=anchor_token_count,
+                importance_weight=importance_weight,
+                window_token_count=window_token_count,
+            )
+            _, _, k_current, v_current, past_kv = kv_info
+        else:
+            attn_output, new_kv_full, scores = self.attn(
+                normed,
+                pos=pos,
+                past_key_values=past_key_values,
+                use_cache=True,
+                kv_cache_mode="ovggt",
+                cache_budget=cache_budget,
+                importance_scores=prev_importance,
+                defer_eviction=False,
+                anchor_token_count=anchor_token_count,
+                importance_weight=importance_weight,
+                window_token_count=window_token_count,
+            )
+
+        x_after_attn = x + self.ls1(attn_output)
+        x_before_mlp = x_after_attn
+        mlp_residual = self.ls2(self.mlp(self.norm2(x_before_mlp)))
+        x_after_mlp = x_before_mlp + mlp_residual
+        if self.eviction_strategy in ("repr_shift", "repr_shift_spatial"):
+            new_importance = self.importance_scorer.compute(
+                x_before_mlp=x_before_mlp,
+                mlp_output=mlp_residual,
+                patch_start_idx=self.patch_start_idx,
+                grid_size=self.patch_grid_size,
+            )
+        else:
+            current_k = (
+                k_current
+                if use_two_stage
+                else new_kv_full[0][:, :, -x.shape[1] :, :]
+            )
+            new_importance = self.importance_scorer.compute(k=current_k)
+
+        kept_indices = None
+        if use_two_stage:
+            num_new = x.shape[1]
+            intra_keep = max(int(num_new * intra_frame_keep_ratio), 1)
+            if intra_keep < num_new:
+                k_current, v_current, intra_indices = self.attn.intra_frame_prune(
+                    k_current, v_current, new_importance, intra_keep
+                )
+                importance_for_eviction = torch.gather(
+                    new_importance, 1, intra_indices
+                )
+            else:
+                importance_for_eviction = new_importance
+            if past_kv is not None:
+                k = torch.cat([past_kv[0], k_current], dim=2)
+                v = torch.cat([past_kv[1], v_current], dim=2)
+            else:
+                k, v = k_current, v_current
+            if cache_budget is not None and k.shape[2] > cache_budget:
+                effective_anchor = (
+                    anchor_token_count
+                    if anchor_token_count is not None
+                    else self.attn.num_anchor_tokens
+                )
+                k, v, scores, kept_indices = self.attn.eviction(
+                    k,
+                    v,
+                    cache_budget,
+                    effective_anchor,
+                    importance_scores=importance_for_eviction,
+                    num_new_tokens=k_current.shape[2],
+                    importance_weight=importance_weight,
+                    window_token_count=window_token_count,
+                )
+            new_kv = (k, v)
+        else:
+            k, v, kept_indices = new_kv_full
+            new_kv = (k, v)
+
+        return x_after_mlp, new_kv, scores, new_importance, kept_indices
+
+    def forward(
+        self,
+        x: Tensor,
+        pos=None,
+        attn_mask=None,
+        past_key_values=None,
+        use_cache=False,
+        kv_cache_mode="start_recent",
+        cache_budget=None,
+        prev_importance=None,
+        intra_frame_keep_ratio=1.0,
+        anchor_token_count=None,
+        importance_weight=0.5,
+        window_token_count=0,
+    ) -> Union[Tensor, Tuple[Tensor, Dict]]:
+        if use_cache and kv_cache_mode == "ovggt":
+            return self._forward_ovggt_cache(
+                x,
+                pos,
+                past_key_values,
+                cache_budget,
+                prev_importance,
+                intra_frame_keep_ratio,
+                anchor_token_count,
+                importance_weight,
+                window_token_count,
+            )
+        if kv_cache_mode not in ("start_recent", "ovggt"):
+            raise ValueError(f"Unsupported VGGT KV cache mode: {kv_cache_mode!r}")
             
         def attn_residual_func(x: Tensor, pos=None, attn_mask=None, past_key_values=None, use_cache=False) -> Union[Tensor, Tuple[Tensor, Dict]]:
             if use_cache:

@@ -1,0 +1,90 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PROJECT_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
+cd "${PROJECT_ROOT}"
+
+export MAGNUM_LOG=quiet HABITAT_SIM_LOG=quiet
+export PROTOCOL_BUFFERS_PYTHON_IMPLEMENTATION=python
+export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
+export PYTHONPATH="${PROJECT_ROOT}/src:${PYTHONPATH:-}"
+
+MASTER_PORT=$((RANDOM % 101 + 20000))
+NPROC_PER_NODE="${NPROC_PER_NODE:-$(nvidia-smi --list-gpus 2>/dev/null | wc -l)}"
+if [ "${NPROC_PER_NODE}" -lt 1 ]; then
+  NPROC_PER_NODE=1
+fi
+
+CHECKPOINT="${CHECKPOINT:-/media/vmo-perception/disk_2/vinhld8/checkpoints/spatialstack_ablation_fourth_r2r}"
+GEOMETRY_ENCODER_PATH="${GEOMETRY_ENCODER_PATH:-/media/vmo-perception/disk_2/vinhld8/checkpoints/VGGT-1B}"
+CONFIG="${CONFIG:-config/vln_r2r.yaml}"
+EVAL_SPLIT="${EVAL_SPLIT:-val_unseen}"
+SAVE_VIDEO="${SAVE_VIDEO:-0}"
+MAX_STEPS="${MAX_STEPS:-400}"
+
+# Faithful OVGGT KV-eviction baseline. VGGT still ingests every Habitat frame
+# (effective kf_every=1); this mode changes retention, never frame ingestion.
+export VGGT_KV_CACHE_MODE=ovggt
+export VGGT_TOTAL_BUDGET="${VGGT_TOTAL_BUDGET:-200000}"
+export VGGT_IMPORTANCE_WEIGHT="${VGGT_IMPORTANCE_WEIGHT:-0.5}"
+export VGGT_INTRA_FRAME_KEEP_RATIO="${VGGT_INTRA_FRAME_KEEP_RATIO:-1.0}"
+export VGGT_GLOBAL_ANCHOR_FRAMES="${VGGT_GLOBAL_ANCHOR_FRAMES:-1}"
+export VGGT_RECENT_PROTECT_FRAMES="${VGGT_RECENT_PROTECT_FRAMES:-0}"
+# OVGGT's head-free history-anchor policy. The original coverage policy needs
+# camera/depth heads, which are deliberately disabled in SpatialStack.
+export VGGT_HISTORY_ANCHOR_STRATEGY="${VGGT_HISTORY_ANCHOR_STRATEGY:-fixed_interval}"
+export VGGT_HISTORY_ANCHOR_INTERVAL="${VGGT_HISTORY_ANCHOR_INTERVAL:-250}"
+export VGGT_HISTORY_ANCHOR_MIN_INTERVAL="${VGGT_HISTORY_ANCHOR_MIN_INTERVAL:-100}"
+export VGGT_HISTORY_ANCHOR_MAX="${VGGT_HISTORY_ANCHOR_MAX:-3}"
+export VGGT_HISTORY_ANCHOR_KEEP_RATIO="${VGGT_HISTORY_ANCHOR_KEEP_RATIO:-0.05}"
+export VGGT_HISTORY_ANCHOR_COVERAGE_THRESHOLD="${VGGT_HISTORY_ANCHOR_COVERAGE_THRESHOLD:-0.2}"
+export VGGT_HISTORY_ANCHOR_SAMPLE_RATIO="${VGGT_HISTORY_ANCHOR_SAMPLE_RATIO:-0.1}"
+export VGGT_KV_DEBUG="${VGGT_KV_DEBUG:-0}"
+
+export VLN_PROJECTED_GEOMETRY_CACHE="${VLN_PROJECTED_GEOMETRY_CACHE:-1}"
+export VLN_ORACLE_STOP="${VLN_ORACLE_STOP:-0}"
+export GEOMETRY_ENCODER_PATH
+
+OUTPUT_PATH="${OUTPUT_PATH:-/media/vmo-perception/disk_2/vinhld8/evaluation_icra/spatialstack_ablation_fourth_r2r_ovggt_budget_${VGGT_TOTAL_BUDGET}}"
+
+echo "CHECKPOINT: ${CHECKPOINT}"
+echo "GEOMETRY_ENCODER_PATH: ${GEOMETRY_ENCODER_PATH}"
+echo "OUTPUT_PATH: ${OUTPUT_PATH}"
+echo "CONFIG: ${CONFIG}"
+echo "EVAL_SPLIT: ${EVAL_SPLIT}"
+echo "NPROC_PER_NODE: ${NPROC_PER_NODE}"
+echo "SAVE_VIDEO: ${SAVE_VIDEO}"
+echo "MAX_STEPS: ${MAX_STEPS}"
+echo "VGGT_KV_CACHE_MODE: ${VGGT_KV_CACHE_MODE}"
+echo "VGGT_TOTAL_BUDGET: ${VGGT_TOTAL_BUDGET}"
+echo "VGGT_IMPORTANCE_WEIGHT: ${VGGT_IMPORTANCE_WEIGHT}"
+echo "VGGT_INTRA_FRAME_KEEP_RATIO: ${VGGT_INTRA_FRAME_KEEP_RATIO}"
+echo "VGGT_GLOBAL_ANCHOR_FRAMES: ${VGGT_GLOBAL_ANCHOR_FRAMES}"
+echo "VGGT_RECENT_PROTECT_FRAMES: ${VGGT_RECENT_PROTECT_FRAMES}"
+echo "VGGT_HISTORY_ANCHOR_STRATEGY: ${VGGT_HISTORY_ANCHOR_STRATEGY}"
+echo "VGGT_HISTORY_ANCHOR_INTERVAL: ${VGGT_HISTORY_ANCHOR_INTERVAL}"
+echo "VGGT_HISTORY_ANCHOR_MIN_INTERVAL: ${VGGT_HISTORY_ANCHOR_MIN_INTERVAL}"
+echo "VGGT_HISTORY_ANCHOR_MAX: ${VGGT_HISTORY_ANCHOR_MAX}"
+echo "VGGT_HISTORY_ANCHOR_KEEP_RATIO: ${VGGT_HISTORY_ANCHOR_KEEP_RATIO}"
+echo "VGGT_HISTORY_ANCHOR_COVERAGE_THRESHOLD: ${VGGT_HISTORY_ANCHOR_COVERAGE_THRESHOLD}"
+echo "VGGT_HISTORY_ANCHOR_SAMPLE_RATIO: ${VGGT_HISTORY_ANCHOR_SAMPLE_RATIO}"
+echo "VGGT_KV_DEBUG: ${VGGT_KV_DEBUG}"
+echo "VLN_PROJECTED_GEOMETRY_CACHE: ${VLN_PROJECTED_GEOMETRY_CACHE}"
+echo "VLN_ORACLE_STOP: ${VLN_ORACLE_STOP}"
+
+mkdir -p "${OUTPUT_PATH}"
+
+extra_args=()
+if [ "${SAVE_VIDEO}" = "1" ]; then
+  extra_args+=(--save_video)
+fi
+
+torchrun --nproc_per_node="${NPROC_PER_NODE}" --master_port="${MASTER_PORT}" src/evaluation.py \
+  --model_path "${CHECKPOINT}" \
+  --geometry_encoder_path "${GEOMETRY_ENCODER_PATH}" \
+  --habitat_config_path "${CONFIG}" \
+  --eval_split "${EVAL_SPLIT}" \
+  --output_path "${OUTPUT_PATH}" \
+  --max_steps "${MAX_STEPS}" \
+  "${extra_args[@]}"

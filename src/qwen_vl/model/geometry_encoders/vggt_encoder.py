@@ -77,6 +77,7 @@ class VGGTEncoder(BaseGeometryEncoder):
         self._eval_streaming = False
         self._streaming_past_key_values = None
         self._streaming_frame_idx = 0
+        self._history_anchor_manager = None
         self.last_vggt_ms = 0.0
         # Legacy frame-strict fallback buffers raw geometry. The Qwen3.5 language-add
         # eval path instead enables _eval_projected_cache and stores post-MLP deltas.
@@ -90,7 +91,99 @@ class VGGTEncoder(BaseGeometryEncoder):
         import os as _os
         _kv_start = int(_os.environ.get("VGGT_KV_START", "8"))
         _kv_recent = int(_os.environ.get("VGGT_KV_RECENT", "48"))
-        print(f"[VGGTEncoder] eval KV-cache window: start={_kv_start} recent={_kv_recent} (total={_kv_start + _kv_recent} frames)")
+        self.kv_cache_mode = _os.environ.get(
+            "VGGT_KV_CACHE_MODE", "start_recent"
+        ).strip().lower()
+        if self.kv_cache_mode not in ("start_recent", "ovggt"):
+            raise ValueError(
+                "VGGT_KV_CACHE_MODE must be 'start_recent' or 'ovggt', got "
+                f"{self.kv_cache_mode!r}"
+            )
+        self.vggt_total_budget = int(_os.environ.get("VGGT_TOTAL_BUDGET", "200000"))
+        self.vggt_importance_weight = float(
+            _os.environ.get("VGGT_IMPORTANCE_WEIGHT", "0.5")
+        )
+        self.vggt_intra_frame_keep_ratio = float(
+            _os.environ.get("VGGT_INTRA_FRAME_KEEP_RATIO", "1.0")
+        )
+        self.vggt_global_anchor_frames = int(
+            _os.environ.get("VGGT_GLOBAL_ANCHOR_FRAMES", "1")
+        )
+        self.vggt_recent_protect_frames = int(
+            _os.environ.get("VGGT_RECENT_PROTECT_FRAMES", "0")
+        )
+        self.vggt_history_anchor_strategy = _os.environ.get(
+            "VGGT_HISTORY_ANCHOR_STRATEGY", "none"
+        ).strip().lower()
+        self.vggt_history_anchor_interval = int(
+            _os.environ.get("VGGT_HISTORY_ANCHOR_INTERVAL", "250")
+        )
+        _min_anchor_interval = _os.environ.get(
+            "VGGT_HISTORY_ANCHOR_MIN_INTERVAL", "100"
+        ).strip().lower()
+        self.vggt_history_anchor_min_interval = (
+            None
+            if _min_anchor_interval in ("", "none")
+            else int(_min_anchor_interval)
+        )
+        self.vggt_history_anchor_max = int(
+            _os.environ.get("VGGT_HISTORY_ANCHOR_MAX", "3")
+        )
+        self.vggt_history_anchor_keep_ratio = float(
+            _os.environ.get("VGGT_HISTORY_ANCHOR_KEEP_RATIO", "0.05")
+        )
+        self.vggt_history_anchor_coverage_threshold = float(
+            _os.environ.get("VGGT_HISTORY_ANCHOR_COVERAGE_THRESHOLD", "0.2")
+        )
+        self.vggt_history_anchor_sample_ratio = float(
+            _os.environ.get("VGGT_HISTORY_ANCHOR_SAMPLE_RATIO", "0.1")
+        )
+        self.vggt_kv_debug = _os.environ.get("VGGT_KV_DEBUG", "0").lower() in (
+            "1", "true", "yes"
+        )
+        if self.vggt_total_budget <= 0:
+            raise ValueError("VGGT_TOTAL_BUDGET must be positive")
+        if not 0.0 <= self.vggt_importance_weight <= 1.0:
+            raise ValueError("VGGT_IMPORTANCE_WEIGHT must be in [0, 1]")
+        if not 0.0 < self.vggt_intra_frame_keep_ratio <= 1.0:
+            raise ValueError("VGGT_INTRA_FRAME_KEEP_RATIO must be in (0, 1]")
+        if self.vggt_global_anchor_frames != 1:
+            raise ValueError("Only VGGT_GLOBAL_ANCHOR_FRAMES=1 is supported")
+        if self.vggt_recent_protect_frames < 0:
+            raise ValueError("VGGT_RECENT_PROTECT_FRAMES must be non-negative")
+        from ..vggt.utils.history_anchor import HistoryAnchorConfig
+
+        self._history_anchor_config = HistoryAnchorConfig(
+            strategy=self.vggt_history_anchor_strategy,
+            interval=self.vggt_history_anchor_interval,
+            min_anchor_interval=self.vggt_history_anchor_min_interval,
+            max_anchors=self.vggt_history_anchor_max,
+            coverage_threshold=self.vggt_history_anchor_coverage_threshold,
+            sample_ratio=self.vggt_history_anchor_sample_ratio,
+            anchor_keep_ratio=self.vggt_history_anchor_keep_ratio,
+        )
+        if (
+            self.kv_cache_mode == "ovggt"
+            and self.vggt_history_anchor_strategy == "coverage"
+        ):
+            raise ValueError(
+                "VGGT_HISTORY_ANCHOR_STRATEGY=coverage requires OVGGT camera/depth "
+                "predictions, but SpatialStack constructs VGGT with those heads disabled. "
+                "Use 'fixed_interval' for the faithful head-free OVGGT policy."
+            )
+        if (
+            self.vggt_history_anchor_strategy == "fixed_interval"
+            and self.vggt_history_anchor_max == 0
+        ):
+            raise ValueError(
+                "VGGT_HISTORY_ANCHOR_MAX must be positive for fixed_interval"
+            )
+        print(
+            f"[VGGTEncoder] KV cache mode={self.kv_cache_mode} "
+            f"start={_kv_start} recent={_kv_recent} "
+            f"total_budget={self.vggt_total_budget} "
+            f"history_anchor={self.vggt_history_anchor_strategy}"
+        )
         self._kv_cache_trim = StartRecentKVCache(start_size=_kv_start, recent_size=_kv_recent, k_seq_dim=2, v_seq_dim=2)
 
     def set_eval_streaming(self, enabled: bool) -> None:
@@ -116,11 +209,14 @@ class VGGTEncoder(BaseGeometryEncoder):
     def reset_streaming_cache(self) -> None:
         self._streaming_past_key_values = None
         self._streaming_frame_idx = 0
+        self._history_anchor_manager = None
         self.last_vggt_ms = 0.0
         self._frame_feature_buffer = (
             [] if self._eval_frame_strict and not self._eval_projected_cache else None
         )
         self._eval_window_indices = None
+        if hasattr(self.vggt.aggregator, "reset_ovggt_cache_state"):
+            self.vggt.aggregator.reset_ovggt_cache_state()
         
     
     def encode(self, images: torch.Tensor) -> torch.Tensor:
@@ -417,6 +513,41 @@ class VGGTEncoder(BaseGeometryEncoder):
         if self._streaming_past_key_values is None:
             self._streaming_past_key_values = [None] * self.vggt.aggregator.depth
 
+        tokens_per_frame = self.vggt.aggregator.patch_start_idx + h_patch * w_patch
+        anchor_token_count = None
+        history_anchor_registered = False
+        history_anchor_fifo = False
+        history_anchor_reason = None
+        if self.kv_cache_mode == "ovggt":
+            from ..vggt.utils.history_anchor import HistoryAnchorManager
+
+            if self._history_anchor_manager is None:
+                self._history_anchor_manager = HistoryAnchorManager(
+                    self._history_anchor_config, tokens_per_frame
+                )
+            elif self._history_anchor_manager.tokens_per_frame != tokens_per_frame:
+                raise ValueError(
+                    "VGGT frame token count changed inside one episode: "
+                    f"{self._history_anchor_manager.tokens_per_frame} -> "
+                    f"{tokens_per_frame}"
+                )
+
+            if self.vggt_history_anchor_strategy == "fixed_interval":
+                (
+                    history_anchor_registered,
+                    history_anchor_fifo,
+                    history_anchor_reason,
+                ) = self._history_anchor_manager.should_become_anchor(
+                    self._streaming_frame_idx
+                )
+                if history_anchor_registered:
+                    self._history_anchor_manager.register_anchor(
+                        self._streaming_frame_idx
+                    )
+            anchor_token_count = (
+                self._history_anchor_manager.get_protected_token_count()
+            )
+
         dtype = torch.bfloat16 if torch.cuda.get_device_capability()[0] >= 8 else torch.float16
         frame_input = frame.unsqueeze(0).unsqueeze(0)
 
@@ -431,10 +562,70 @@ class VGGTEncoder(BaseGeometryEncoder):
                     frame_input,
                     past_key_values=self._streaming_past_key_values,
                     use_cache=True,
-                    past_frame_idx=0,
+                    past_frame_idx=self._streaming_frame_idx,
+                    kv_cache_mode=self.kv_cache_mode,
+                    total_budget=(
+                        self.vggt_total_budget
+                        if self.kv_cache_mode == "ovggt" else 0
+                    ),
+                    anchor_token_count=anchor_token_count,
+                    importance_weight=self.vggt_importance_weight,
+                    window_token_count=(
+                        self.vggt_recent_protect_frames
+                        * tokens_per_frame
+                    ),
+                    intra_frame_keep_ratio=self.vggt_intra_frame_keep_ratio,
                 )
                 aggregated_tokens_list, patch_start_idx, self._streaming_past_key_values = output
-                self._streaming_past_key_values = self._kv_cache_trim(self._streaming_past_key_values)
+                if self.kv_cache_mode == "start_recent":
+                    self._streaming_past_key_values = self._kv_cache_trim(
+                        self._streaming_past_key_values
+                    )
+                elif history_anchor_registered:
+                    self._streaming_past_key_values = (
+                        self.vggt.aggregator.sync_anchor_change(
+                            self._streaming_past_key_values,
+                            anchor_token_count=anchor_token_count,
+                            tokens_per_frame=tokens_per_frame,
+                            anchor_keep_ratio=(
+                                self.vggt_history_anchor_keep_ratio
+                            ),
+                            anchor_token_indices=None,
+                            is_fifo=history_anchor_fifo,
+                        )
+                    )
+                    if self.vggt_kv_debug:
+                        fifo_text = " fifo" if history_anchor_fifo else ""
+                        print(
+                            f"[VGGT-HistoryAnchor] frame={self._streaming_frame_idx}"
+                            f"{fifo_text} protected={anchor_token_count} "
+                            f"reason={history_anchor_reason}",
+                            flush=True,
+                        )
+                if self.vggt_kv_debug:
+                    retained = [
+                        int(kv[0].shape[2]) if kv is not None else 0
+                        for kv in self._streaming_past_key_values
+                    ]
+                    budgets = getattr(self.vggt.aggregator, "last_budgets", None)
+                    budget_text = (
+                        budgets.detach().cpu().tolist() if budgets is not None else None
+                    )
+                    eviction_counts = getattr(
+                        self.vggt.aggregator, "eviction_counts", None
+                    )
+                    eviction_text = (
+                        eviction_counts.detach().cpu().tolist()
+                        if eviction_counts is not None else None
+                    )
+                    print(
+                        f"[VGGT-KV] frame={self._streaming_frame_idx} "
+                        f"mode={self.kv_cache_mode} retained={retained} "
+                        f"protected={anchor_token_count} budgets={budget_text} "
+                        f"evictions={eviction_text}",
+                        flush=True,
+                    )
+                self._streaming_frame_idx += 1
 
                 if torch.cuda.is_available():
                     vggt_end.record()

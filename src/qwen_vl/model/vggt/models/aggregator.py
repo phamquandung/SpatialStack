@@ -70,8 +70,14 @@ class Aggregator(nn.Module):
         qk_norm=True,
         rope_freq=100,
         init_values=0.01,
+        eviction_strategy="repr_shift_spatial",
+        intra_frame_keep_ratio=1.0,
+        spatial_alpha=0.5,
     ):
         super().__init__()
+        self.eviction_strategy = eviction_strategy
+        self.intra_frame_keep_ratio = intra_frame_keep_ratio
+        self.spatial_alpha = spatial_alpha
 
         self.__build_patch_embed__(patch_embed, img_size, patch_size, num_register_tokens, embed_dim=embed_dim)
 
@@ -108,6 +114,9 @@ class Aggregator(nn.Module):
                     init_values=init_values,
                     qk_norm=qk_norm,
                     rope=self.rope,
+                    eviction_strategy=eviction_strategy,
+                    spatial_alpha=spatial_alpha,
+                    patch_start_idx=1 + num_register_tokens,
                 )
                 for _ in range(depth)
             ]
@@ -123,6 +132,11 @@ class Aggregator(nn.Module):
             raise ValueError(f"depth ({depth}) must be divisible by aa_block_size ({aa_block_size})")
 
         self.aa_block_num = self.depth // self.aa_block_size
+        self.register_buffer("last_scores", torch.zeros(self.depth), persistent=False)
+        self.register_buffer(
+            "eviction_counts", torch.zeros(self.depth, dtype=torch.long), persistent=False
+        )
+        self.last_budgets = None
 
         # Note: We have two camera tokens, one for the first frame and one for the rest
         # The same applies for register tokens
@@ -194,7 +208,13 @@ class Aggregator(nn.Module):
         images: torch.Tensor,
         past_key_values=None,
         use_cache=False,
-        past_frame_idx=0
+        past_frame_idx=0,
+        kv_cache_mode="start_recent",
+        total_budget=0,
+        anchor_token_count=None,
+        importance_weight=0.5,
+        window_token_count=0,
+        intra_frame_keep_ratio=None,
     ) -> Tuple[List[torch.Tensor], int]:
         """
         Args:
@@ -208,9 +228,14 @@ class Aggregator(nn.Module):
         """
         B, S, C_in, H, W = images.shape
 
+        if kv_cache_mode not in ("start_recent", "ovggt"):
+            raise ValueError(f"Unsupported VGGT KV cache mode: {kv_cache_mode!r}")
         if use_cache and past_key_values[0] is not None:
-            _, _, S_true, _, _ = past_key_values[0][0].shape
-            S_true += 1
+            if kv_cache_mode == "ovggt":
+                S_true = past_frame_idx + 1
+            else:
+                _, _, S_true, _, _ = past_key_values[0][0].shape
+                S_true += 1
         else:
             S_true = S
         
@@ -258,9 +283,35 @@ class Aggregator(nn.Module):
         # update P because we added special tokens
         _, P, C = tokens.shape
 
+        patch_grid = (H // self.patch_size, W // self.patch_size)
+        for block in self.global_blocks:
+            block.patch_grid_size = patch_grid
+
         frame_idx = 0
         global_idx = 0
         output_list = []
+        current_budgets = (
+            self._calculate_dynamic_budgets(total_budget)
+            if use_cache and kv_cache_mode == "ovggt"
+            else None
+        )
+        if current_budgets is not None:
+            if anchor_token_count is None:
+                anchor_token_count = P
+            if int(current_budgets.min().item()) < int(anchor_token_count):
+                raise ValueError(
+                    "VGGT_TOTAL_BUDGET allocates fewer tokens than the protected "
+                    f"global anchor: min_layer_budget={int(current_budgets.min().item())}, "
+                    f"anchor_tokens={int(anchor_token_count)}"
+                )
+            self.last_budgets = current_budgets.detach().clone()
+        scores = []
+        prev_importance = None
+        keep_ratio = (
+            self.intra_frame_keep_ratio
+            if intra_frame_keep_ratio is None
+            else float(intra_frame_keep_ratio)
+        )
 
         for _ in range(self.aa_block_num):
             for attn_type in self.aa_order:
@@ -272,12 +323,54 @@ class Aggregator(nn.Module):
                     if use_cache:
                         if past_key_values[global_idx] is not None:
                             k, v = past_key_values[global_idx]
-                        tokens, global_idx, global_intermediates, new_kv = self._process_global_attention(
+                        process_output = self._process_global_attention(
                             tokens, B, S, P, C, global_idx, pos=pos,
                             past_key_values_block=past_key_values[global_idx] if past_key_values[global_idx] is not None else None,
                             use_cache=True,
-                            past_frame_idx=past_frame_idx
+                            past_frame_idx=past_frame_idx,
+                            kv_cache_mode=kv_cache_mode,
+                            cache_budget=(
+                                int(current_budgets[global_idx].item())
+                                if current_budgets is not None else None
+                            ),
+                            prev_importance=prev_importance,
+                            intra_frame_keep_ratio=keep_ratio,
+                            anchor_token_count=anchor_token_count,
+                            importance_weight=importance_weight,
+                            window_token_count=window_token_count,
                         )
+                        if kv_cache_mode == "ovggt":
+                            (
+                                tokens,
+                                global_idx,
+                                global_intermediates,
+                                new_kv,
+                                current_score,
+                                prev_importance,
+                                kept_indices,
+                            ) = process_output
+                            layer_idx = global_idx - 1
+                            if kept_indices is not None:
+                                self.eviction_counts[layer_idx] += 1
+                            scores.append(
+                                current_score
+                                if current_score is not None
+                                else self.last_scores[layer_idx].item()
+                            )
+                        else:
+                            tokens, global_idx, global_intermediates, new_kv = process_output
+                        if kv_cache_mode == "ovggt":
+                            retained_tokens = int(new_kv[0].shape[2])
+                            layer_budget = int(current_budgets[global_idx - 1].item())
+                            if retained_tokens > layer_budget:
+                                raise AssertionError(
+                                    f"VGGT layer {global_idx - 1} retained {retained_tokens} "
+                                    f"tokens with budget {layer_budget}"
+                                )
+                            if retained_tokens < int(anchor_token_count):
+                                raise AssertionError(
+                                    f"VGGT layer {global_idx - 1} lost protected anchor tokens"
+                                )
                         past_key_values[global_idx - 1] = new_kv
                     else: 
                         tokens, global_idx, global_intermediates = self._process_global_attention(
@@ -289,6 +382,15 @@ class Aggregator(nn.Module):
                 # concat frame and global intermediates, [B x S x P x 2C]
                 concat_inter = torch.cat([frame_intermediates[i], global_intermediates[i]], dim=-1)
                 output_list.append(concat_inter)
+
+        if kv_cache_mode == "ovggt" and scores:
+            self.last_scores.copy_(
+                torch.tensor(
+                    scores,
+                    device=self.last_scores.device,
+                    dtype=self.last_scores.dtype,
+                )
+            )
 
         del concat_inter
         del frame_intermediates
@@ -329,7 +431,14 @@ class Aggregator(nn.Module):
         pos=None,
         past_key_values_block=None,
         use_cache=False,
-        past_frame_idx=0
+        past_frame_idx=0,
+        kv_cache_mode="start_recent",
+        cache_budget=None,
+        prev_importance=None,
+        intra_frame_keep_ratio=1.0,
+        anchor_token_count=None,
+        importance_weight=0.5,
+        window_token_count=0,
     ) -> Union[Tuple[torch.Tensor, int, List[torch.Tensor]], Tuple[torch.Tensor, int, List[torch.Tensor], List]]:
         """
         Process global attention blocks. We keep tokens in shape (B, S*P, C).
@@ -353,13 +462,38 @@ class Aggregator(nn.Module):
                 attn_mask = None
                 
             if use_cache:
-                tokens, block_kv = self.global_blocks[global_idx](
-                    tokens, 
-                    pos=pos, 
-                    attn_mask=attn_mask, 
-                    past_key_values=past_key_values_block,
-                    use_cache=True
-                )
+                if kv_cache_mode == "ovggt":
+                    effective_keep_ratio = (
+                        1.0 if past_frame_idx == 0 else intra_frame_keep_ratio
+                    )
+                    (
+                        tokens,
+                        block_kv,
+                        scores,
+                        new_importance,
+                        kept_indices,
+                    ) = self.global_blocks[global_idx](
+                        tokens,
+                        pos=pos,
+                        past_key_values=past_key_values_block,
+                        use_cache=True,
+                        kv_cache_mode="ovggt",
+                        cache_budget=cache_budget,
+                        prev_importance=prev_importance,
+                        intra_frame_keep_ratio=effective_keep_ratio,
+                        anchor_token_count=anchor_token_count,
+                        importance_weight=importance_weight,
+                        window_token_count=window_token_count,
+                    )
+                else:
+                    tokens, block_kv = self.global_blocks[global_idx](
+                        tokens,
+                        pos=pos,
+                        attn_mask=attn_mask,
+                        past_key_values=past_key_values_block,
+                        use_cache=True,
+                        kv_cache_mode="start_recent",
+                    )
             else:
                 tokens = self.global_blocks[global_idx](tokens, pos=pos, attn_mask=attn_mask)
             global_idx += 1
@@ -368,8 +502,173 @@ class Aggregator(nn.Module):
             # if self.use_causal_global:
             #     del attn_mask
         if use_cache:
+            if kv_cache_mode == "ovggt":
+                return (
+                    tokens,
+                    global_idx,
+                    intermediates,
+                    block_kv,
+                    scores,
+                    new_importance,
+                    kept_indices,
+                )
             return tokens, global_idx, intermediates, block_kv
         return tokens, global_idx, intermediates
+
+    def _calculate_dynamic_budgets(self, total_budget):
+        with torch.no_grad():
+            diversity_scores = 1.0 - self.last_scores
+            proportions = torch.softmax(diversity_scores / 0.5, dim=0)
+            budgets = proportions * max(int(total_budget), 0)
+        return budgets.int()
+
+    def sync_anchor_change(
+        self,
+        past_key_values,
+        anchor_token_count: int,
+        tokens_per_frame: int,
+        anchor_keep_ratio: float,
+        anchor_token_indices: Optional[torch.Tensor] = None,
+        is_fifo: bool = False,
+    ):
+        """Promote the newest frame chunk into OVGGT's protected anchor prefix.
+
+        Cache keys are already RoPE-rotated, so changing their storage order does
+        not alter their positions. This follows OVGGT's count-based/FIFO layout.
+        """
+        if past_key_values is None or anchor_token_count is None:
+            return past_key_values
+        if anchor_token_count <= tokens_per_frame:
+            return past_key_values
+
+        if anchor_token_indices is not None:
+            anchor_chunk = anchor_token_indices.shape[-1]
+        else:
+            anchor_chunk = max(int(tokens_per_frame * anchor_keep_ratio), 1)
+        anchor_chunk = min(anchor_chunk, tokens_per_frame)
+        global_anchor_end = tokens_per_frame
+
+        for idx in range(self.depth):
+            if past_key_values[idx] is None:
+                continue
+            k, v = past_key_values[idx]
+            num_tokens = k.shape[2]
+            if num_tokens <= anchor_token_count:
+                continue
+
+            new_frame_start = num_tokens - tokens_per_frame
+            if new_frame_start < anchor_token_count or new_frame_start < 0:
+                continue
+            if anchor_chunk <= 0:
+                continue
+
+            new_frame_anchor_end = min(new_frame_start + anchor_chunk, num_tokens)
+            if anchor_token_indices is not None:
+                k_frame = k[:, :, new_frame_start:new_frame_start + tokens_per_frame]
+                v_frame = v[:, :, new_frame_start:new_frame_start + tokens_per_frame]
+                frame_indices = torch.arange(tokens_per_frame, device=k.device)
+                indices = anchor_token_indices
+                if indices.dim() == 1:
+                    indices = indices.unsqueeze(0).expand(k.shape[0], -1)
+
+                selected_k, selected_v = [], []
+                remaining_k, remaining_v = [], []
+                for batch_idx in range(k.shape[0]):
+                    selected = indices[batch_idx]
+                    selected = selected[
+                        (selected >= 0) & (selected < tokens_per_frame)
+                    ]
+                    if selected.numel() == 0:
+                        continue
+                    mask = torch.ones(
+                        tokens_per_frame, device=k.device, dtype=torch.bool
+                    )
+                    mask[selected] = False
+                    remaining = frame_indices[mask]
+                    selected_k.append(k_frame[batch_idx:batch_idx + 1, :, selected])
+                    selected_v.append(v_frame[batch_idx:batch_idx + 1, :, selected])
+                    remaining_k.append(k_frame[batch_idx:batch_idx + 1, :, remaining])
+                    remaining_v.append(v_frame[batch_idx:batch_idx + 1, :, remaining])
+                if not selected_k:
+                    continue
+                k_selected = torch.cat(selected_k, dim=0)
+                v_selected = torch.cat(selected_v, dim=0)
+                k_remaining = torch.cat(remaining_k, dim=0)
+                v_remaining = torch.cat(remaining_v, dim=0)
+            else:
+                k_selected = k[:, :, new_frame_start:new_frame_anchor_end]
+                v_selected = v[:, :, new_frame_start:new_frame_anchor_end]
+                k_remaining = k[:, :, new_frame_anchor_end:new_frame_start + tokens_per_frame]
+                v_remaining = v[:, :, new_frame_anchor_end:new_frame_start + tokens_per_frame]
+
+            if is_fifo:
+                demote_start = global_anchor_end
+                demote_end = min(
+                    global_anchor_end + anchor_chunk, anchor_token_count
+                )
+                if demote_end <= demote_start:
+                    continue
+                k_new = torch.cat(
+                    [
+                        k[:, :, :demote_start],
+                        k[:, :, demote_end:anchor_token_count],
+                        k_selected,
+                        k[:, :, anchor_token_count:new_frame_start],
+                        k_remaining,
+                        k[:, :, new_frame_start + tokens_per_frame:],
+                        k[:, :, demote_start:demote_end],
+                    ],
+                    dim=2,
+                )
+                v_new = torch.cat(
+                    [
+                        v[:, :, :demote_start],
+                        v[:, :, demote_end:anchor_token_count],
+                        v_selected,
+                        v[:, :, anchor_token_count:new_frame_start],
+                        v_remaining,
+                        v[:, :, new_frame_start + tokens_per_frame:],
+                        v[:, :, demote_start:demote_end],
+                    ],
+                    dim=2,
+                )
+            else:
+                old_anchor_end = max(
+                    anchor_token_count - anchor_chunk, global_anchor_end
+                )
+                if old_anchor_end > new_frame_start:
+                    continue
+                k_new = torch.cat(
+                    [
+                        k[:, :, :old_anchor_end],
+                        k_selected,
+                        k[:, :, old_anchor_end:new_frame_start],
+                        k_remaining,
+                        k[:, :, new_frame_start + tokens_per_frame:],
+                    ],
+                    dim=2,
+                )
+                v_new = torch.cat(
+                    [
+                        v[:, :, :old_anchor_end],
+                        v_selected,
+                        v[:, :, old_anchor_end:new_frame_start],
+                        v_remaining,
+                        v[:, :, new_frame_start + tokens_per_frame:],
+                    ],
+                    dim=2,
+                )
+            past_key_values[idx] = (k_new, v_new)
+
+        return past_key_values
+
+    def reset_ovggt_cache_state(self):
+        self.last_scores.zero_()
+        self.eviction_counts.zero_()
+        self.last_budgets = None
+        for block in self.global_blocks:
+            if hasattr(block.attn, "_reset_cache_state"):
+                block.attn._reset_cache_state()
 
 
 def slice_expand_and_flatten(token_tensor, B, S):
