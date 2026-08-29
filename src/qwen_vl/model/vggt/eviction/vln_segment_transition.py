@@ -245,7 +245,17 @@ def compute_instruction_segment_relevance(aligned_visual_tokens, segment_embeddi
 
 
 @torch.no_grad()
-def build_frame_descriptor(aligned_visual_tokens, confidence):
+def build_frame_descriptor(aligned_visual_tokens, confidence, pooling="confidence"):
+    """Frame-level summary vector; `transition` is the cosine distance between these.
+
+    `pooling="uniform"` drops the confidence weighting. That weighting mechanically ties
+    the descriptor to confidence — a low-confidence frame reweights the pool, shifting the
+    descriptor and inflating its distance from the previous one. Measured across frames,
+    corr(transition, confidence) = -0.84, and this is the suspected cause: it makes the
+    transition term fight the confidence term inside the score instead of complementing it.
+    """
+    if pooling == "uniform":
+        return F.normalize(aligned_visual_tokens.float().mean(0), dim=-1)
     weights = confidence.float().flatten().clamp(0, 1)
     if aligned_visual_tokens.shape[0] != weights.numel():
         raise ValueError("confidence count must equal aligned visual token count")
@@ -255,14 +265,24 @@ def build_frame_descriptor(aligned_visual_tokens, confidence):
 
 
 @torch.no_grad()
-def compute_local_transition_score(current_descriptor, recent_descriptors):
+def compute_local_transition_score(current_descriptor, recent_descriptors, reduce="mean"):
+    """Novelty of the current frame against previously seen ones.
+
+    `reduce="max"` scores against the single most similar frame in the window rather than
+    the average of it. Averaging over a short window answers "did I just turn?" — four
+    consecutive navigation frames are near-identical, which is why the realised range of
+    this term is only 0-0.057. Taking the closest match answers "have I been somewhere
+    like this before?", so revisiting a room correctly scores low novelty, which the mean
+    over a 4-frame window cannot detect.
+    """
     if not recent_descriptors:
         return current_descriptor.new_zeros((), dtype=torch.float32)
     # Both sides come out of build_frame_descriptor already L2-normalised in fp32, so the
     # matvec is the cosine directly.
     recent = torch.stack([x.to(current_descriptor.device) for x in recent_descriptors]).float()
-    cosine = recent @ current_descriptor.float()
-    return ((1 - cosine.clamp(-1, 1)) * 0.5).mean().clamp(0, 1)
+    cosine = (recent @ current_descriptor.float()).clamp(-1, 1)
+    closeness = cosine.max() if reduce == "max" else cosine.mean()
+    return ((1 - closeness) * 0.5).clamp(0, 1)
 
 
 @torch.no_grad()

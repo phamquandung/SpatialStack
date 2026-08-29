@@ -176,6 +176,8 @@ class VLNScoreProbe:
         budget: int,
         candidate_component_std: Optional[torch.Tensor] = None,
         candidate_variance_share: Optional[torch.Tensor] = None,
+        candidate_true_share: Optional[torch.Tensor] = None,
+        candidate_component_corr: Optional[torch.Tensor] = None,
     ) -> None:
         """Record what survived eviction in ``layer_idx``."""
         if not self.should_log(frame_id) or layer_idx not in self.layers:
@@ -203,8 +205,16 @@ class VLNScoreProbe:
                 age.mean(),
             ]
         )
+        n_comp_t = candidate_component_std.numel()
         diagnostics = torch.cat([
-            candidate_component_std.float(), candidate_variance_share.float()
+            candidate_component_std.float(),
+            candidate_variance_share.float(),
+            candidate_true_share.float()
+            if candidate_true_share is not None
+            else torch.zeros(n_comp_t, device=device),
+            candidate_component_corr.float().reshape(-1)
+            if candidate_component_corr is not None
+            else torch.zeros(n_comp_t * n_comp_t, device=device),
         ])
         packed = torch.cat([age_q, scalars, diagnostics, seg_hist]).cpu().tolist()
         n_q = len(_QUANTILES)
@@ -212,7 +222,10 @@ class VLNScoreProbe:
         scalar_flat = packed[n_q : n_q + 9]
         n_comp = candidate_component_std.numel()
         diagnostic_flat = packed[n_q + 9 : n_q + 9 + 2 * n_comp]
-        seg_flat = packed[n_q + 9 + 2 * n_comp :]
+        true_share_flat = packed[n_q + 9 + 2 * n_comp : n_q + 9 + 3 * n_comp]
+        corr_end = n_q + 9 + 3 * n_comp + n_comp * n_comp
+        corr_flat = packed[n_q + 9 + 3 * n_comp : corr_end]
+        seg_flat = packed[corr_end:]
         # Derived from the tensor the scorer handed over, so adding a score component
         # does not silently shift the seg-histogram slice by one.
         component_names = _COMPONENT_NAMES[:n_comp]
@@ -238,6 +251,17 @@ class VLNScoreProbe:
                 },
                 "candidate_variance_proxy_share": {
                     name: diagnostic_flat[idx + n_comp] for idx, name in enumerate(component_names)
+                },
+                # Covariance-aware: Var(S) = sum_i Cov(w_i z_i, S). Sums to 1; a component
+                # that fights the others goes negative, which the proxy share cannot show.
+                "candidate_variance_true_share": {
+                    name: true_share_flat[idx] for idx, name in enumerate(component_names)
+                },
+                "candidate_component_corr": {
+                    f"{a}|{b}": corr_flat[i * n_comp + j]
+                    for i, a in enumerate(component_names)
+                    for j, b in enumerate(component_names)
+                    if j > i
                 },
                 "quantiles": list(_QUANTILES),
                 "age_quantiles": age_flat,

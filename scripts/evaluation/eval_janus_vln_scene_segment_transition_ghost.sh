@@ -16,18 +16,18 @@ if [ "${NPROC_PER_NODE}" -lt 1 ]; then
   NPROC_PER_NODE=1
 fi
 
-CHECKPOINT="${CHECKPOINT:-/home/tripnv/SpatialStack/checkpoints/spatialstack_janus_vln_train-gate-scale-4B-loss-3}"
+CHECKPOINT="${CHECKPOINT:-/home/tripnv/SpatialStack/checkpoints/spatialstack_ablation_fourth_r2r}"
 GEOMETRY_ENCODER_PATH="${GEOMETRY_ENCODER_PATH:-/home/tripnv/SpatialStack/checkpoints/VGGT-1B}"
 SCENE_IDS="${SCENE_IDS:-a}"
 CONFIG="${CONFIG:-config/vln_r2r_local.yaml}"
 EVAL_SPLIT="${EVAL_SPLIT:-val_unseen}"
 SAVE_VIDEO="${SAVE_VIDEO:-0}"
-VLN_SEGMENT_TRANSITION_WEIGHTS_PATH="${VLN_SEGMENT_TRANSITION_WEIGHTS_PATH:-configs/vln_segment_transition_weights.json}"
+VLN_SEGMENT_TRANSITION_WEIGHTS_PATH="${VLN_SEGMENT_TRANSITION_WEIGHTS_PATH:-/home/tripnv/project/Token_eviction/SpatialStack/configs/segment_uniform_3components.json}"
 VGGT_TOTAL_BUDGET="${VGGT_TOTAL_BUDGET:-900000}"
 MAX_STEPS="${MAX_STEPS:-400}"
-OUTPUT_PATH="${OUTPUT_PATH:-/home/tripnv/project/Token_eviction/SpatialStack/ablation/scene_segment_transition_bf16k_uniform/budget_900000_steps_400}"
+OUTPUT_PATH="${OUTPUT_PATH:-/home/tripnv/project/Token_eviction/SpatialStack/evaluation_gate_scale_fix_eval/base/budget_900000_steps_400}"
 
-# Enable the original GHOST cache workflow with the additive VLN scoring proposal.
+# Enable the original GHOST cache workflow with the additive VLN scoring proposal.  
 export USE_GHOST_KV_CACHE="${USE_GHOST_KV_CACHE:-1}"
 export GHOST_SCORE_MODE="${GHOST_SCORE_MODE:-vln_segment_transition}"
 export VLN_SEGMENT_TRANSITION_WEIGHTS_PATH

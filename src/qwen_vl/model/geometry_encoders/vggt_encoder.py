@@ -297,11 +297,15 @@ class VGGTEncoder(BaseGeometryEncoder):
         relevance, best_segment = compute_instruction_segment_relevance(
             visual, self._vln_instruction_state.segment_embeddings.to(device)
         )
-        descriptor = build_frame_descriptor(visual, confidence)
-        transition = compute_local_transition_score(
-            descriptor, self._vln_transition_state.descriptors
-        )
         transition_cfg = self.vln_segment_transition_weights["transition"]
+        descriptor = build_frame_descriptor(
+            visual, confidence,
+            pooling=transition_cfg.get("descriptor_pooling", "confidence"),
+        )
+        transition = compute_local_transition_score(
+            descriptor, self._vln_transition_state.descriptors,
+            reduce=transition_cfg.get("novelty_reduce", "mean"),
+        )
         anchor = compute_transition_anchor(
             transition,
             confidence,
@@ -431,6 +435,7 @@ class VGGTEncoder(BaseGeometryEncoder):
                 normalization=self.vln_segment_transition_weights["normalization"]["candidate_terms"],
             )
             candidate_component_std = candidate_variance_share = None
+            candidate_true_share = candidate_component_corr = None
             if (
                 probe is not None
                 and probe.should_log(current_frame_id)
@@ -444,6 +449,27 @@ class VGGTEncoder(BaseGeometryEncoder):
                     (float(score_weights[name]) * candidate_component_std[idx]).square()
                     for idx, name in enumerate(component_names)
                 ])
+                # The proxy share above assumes the components are independent. They are
+                # not, so a component can report healthy standalone variance while being
+                # cancelled inside the sum. Var(S) = sum_i Cov(w_i z_i, S) is the
+                # decomposition that survives correlation: it sums to 1, and a component
+                # that fights the sum goes negative.
+                comp_matrix = torch.stack(
+                    [normalized_components[name] for name in component_names]
+                )
+                comp_centered = comp_matrix - comp_matrix.mean(dim=1, keepdim=True)
+                comp_sigma = comp_centered.square().mean(dim=1).sqrt().clamp_min(1e-6)
+                candidate_component_corr = (
+                    comp_centered @ comp_centered.T
+                ) / (comp_matrix.shape[1] * comp_sigma[:, None] * comp_sigma[None, :])
+                w_vec = torch.tensor(
+                    [float(score_weights[name]) for name in component_names],
+                    device=comp_matrix.device, dtype=comp_matrix.dtype,
+                )
+                summed_centered = (w_vec[:, None] * comp_centered).sum(0)
+                candidate_true_share = (
+                    (w_vec[:, None] * comp_centered) * summed_centered
+                ).mean(dim=1) / summed_centered.square().mean().clamp_min(1e-12)
                 candidate_variance_share = weighted_variance / weighted_variance.sum().clamp_min(1e-12)
             if key.shape[2] > layer_budget:
                 # Only pay for the gather when the layer is actually over budget: a
@@ -467,6 +493,8 @@ class VGGTEncoder(BaseGeometryEncoder):
                     layer_budget,
                     candidate_component_std=candidate_component_std,
                     candidate_variance_share=candidate_variance_share,
+                    candidate_true_share=candidate_true_share,
+                    candidate_component_corr=candidate_component_corr,
                 )
         # Keep the descriptor fp32 and already L2-normalised: casting it to the visual
         # dtype only to cast it back (and re-normalise) next frame loses precision on a
@@ -593,6 +621,14 @@ class VGGTEncoder(BaseGeometryEncoder):
         window = transition.get("recent_window_size")
         if not isinstance(window, int) or window < 1:
             raise ValueError(f"{path}: transition.recent_window_size must be a positive integer")
+        if transition.get("descriptor_pooling", "confidence") not in ("confidence", "uniform"):
+            raise ValueError(
+                f"{path}: transition.descriptor_pooling must be 'confidence' or 'uniform'"
+            )
+        if transition.get("novelty_reduce", "mean") not in ("mean", "max"):
+            raise ValueError(
+                f"{path}: transition.novelty_reduce must be 'mean' or 'max'"
+            )
         gate_names = ("confidence_gate_weight", "instruction_gate_weight")
         for name in gate_names:
             value = transition.get(name)
