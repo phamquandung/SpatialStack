@@ -310,8 +310,9 @@ class VGGTEncoder(BaseGeometryEncoder):
             transition,
             confidence,
             relevance,
-            confidence_weight=float(transition_cfg["confidence_gate_weight"]),
-            instruction_weight=float(transition_cfg["instruction_gate_weight"]),
+            confidence_weight=float(transition_cfg.get("confidence_gate_weight", 0.5)),
+            instruction_weight=float(transition_cfg.get("instruction_gate_weight", 0.5)),
+            gate=transition_cfg.get("gate", "blend"),
         )
 
         pose = meta.get("camera_pose")
@@ -629,13 +630,27 @@ class VGGTEncoder(BaseGeometryEncoder):
             raise ValueError(
                 f"{path}: transition.novelty_reduce must be 'mean' or 'max'"
             )
+        gate_mode = transition.get("gate", "blend")
+        if gate_mode not in ("blend", "none"):
+            raise ValueError(f"{path}: transition.gate must be 'blend' or 'none'")
         gate_names = ("confidence_gate_weight", "instruction_gate_weight")
-        for name in gate_names:
-            value = transition.get(name)
-            if not isinstance(value, (int, float)) or not 0 <= float(value) <= 1:
-                raise ValueError(f"{path}: transition.{name} must be in [0,1]")
-        if abs(sum(float(transition[name]) for name in gate_names) - 1.0) > 1e-6:
-            raise ValueError(f"{path}: transition gate weights must sum to 1")
+        if gate_mode == "none":
+            # The weights are unused here, so accepting them silently would let a config
+            # look like it mixes confidence and instruction into transition when it does
+            # not. Reject them instead of ignoring them.
+            present = [n for n in gate_names if n in transition]
+            if present:
+                raise ValueError(
+                    f"{path}: transition.gate is 'none', so {present} have no effect; "
+                    "remove them"
+                )
+        else:
+            for name in gate_names:
+                value = transition.get(name)
+                if not isinstance(value, (int, float)) or not 0 <= float(value) <= 1:
+                    raise ValueError(f"{path}: transition.{name} must be in [0,1]")
+            if abs(sum(float(transition[name]) for name in gate_names) - 1.0) > 1e-6:
+                raise ValueError(f"{path}: transition gate weights must sum to 1")
         
     
     def encode(self, images: torch.Tensor) -> torch.Tensor:
