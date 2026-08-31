@@ -328,8 +328,11 @@ def compute_cache_novelty(descriptors):
     face the same population: the result is "how unique is this viewpoint among everywhere
     we have been", recomputed each step rather than fixed on arrival.
     """
-    if len(descriptors) < 2:
-        return descriptors[0].new_zeros((len(descriptors),), dtype=torch.float32)
+    if not descriptors:
+        raise ValueError("compute_cache_novelty needs at least the current frame")
+    if len(descriptors) == 1:
+        # Frame 0: nothing to be unique against yet.
+        return descriptors[0].new_zeros((1,), dtype=torch.float32)
     d = torch.stack([x.to(descriptors[-1].device) for x in descriptors]).float()
     cosine = (d @ d.T).clamp(-1, 1)
     cosine.fill_diagonal_(-1.0)          # a frame is not its own neighbour

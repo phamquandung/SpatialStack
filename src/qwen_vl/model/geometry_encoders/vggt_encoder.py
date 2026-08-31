@@ -310,6 +310,12 @@ class VGGTEncoder(BaseGeometryEncoder):
             descriptor, self._vln_transition_state.descriptors,
             reduce=transition_cfg.get("novelty_reduce", "mean"),
         )
+        # The bank must contain this frame before the cache-wide novelty is computed:
+        # the current frame's tokens are scored in the same pass, so its frame_id has to
+        # be a valid index. The recent-window deque above is deliberately appended later,
+        # since `compute_local_transition_score` must only see *previous* frames.
+        if self._vln_frame_descriptors is not None:
+            self._vln_frame_descriptors.append(descriptor.detach())
         anchor = compute_transition_anchor(
             transition,
             confidence,
@@ -442,7 +448,13 @@ class VGGTEncoder(BaseGeometryEncoder):
                 )
             layer_budget = int(self._vln_layer_budgets[layer_idx])
             if cache_novelty is not None:
-                refreshed = cache_novelty[candidate_meta.frame_id.long()]
+                fid = candidate_meta.frame_id.long()
+                if int(fid.max()) >= cache_novelty.numel():
+                    raise AssertionError(
+                        f"frame_id {int(fid.max())} has no descriptor "
+                        f"(bank holds {cache_novelty.numel()})"
+                    )
+                refreshed = cache_novelty[fid]
                 candidate_meta.transition_score = (
                     refreshed * (~candidate_meta.is_special.bool())
                 ).to(candidate_meta.transition_score.dtype)
@@ -518,8 +530,6 @@ class VGGTEncoder(BaseGeometryEncoder):
         # dtype only to cast it back (and re-normalise) next frame loses precision on a
         # cosine that consecutive VLN frames drive to within ~1e-3 of each other.
         self._vln_transition_state.descriptors.append(descriptor.detach())
-        if self._vln_frame_descriptors is not None:
-            self._vln_frame_descriptors.append(descriptor.detach())
         # Only the immediately previous pose is needed next frame. Drop old dense
         # depth/confidence maps so this scorer does not create an unbounded side memory.
         if len(self._streaming_frame_metadata) > 2:
