@@ -312,6 +312,30 @@ def compute_transition_anchor(
     return (value * blended).clamp(0, 1)
 
 
+@torch.no_grad()
+def compute_cache_novelty(descriptors):
+    """Re-score every seen frame against the same reference set, once per step.
+
+    `compute_local_transition_score` freezes a frame's novelty at insertion, and with a
+    growing comparison window that value is biased by *when* the frame arrived: frame k is
+    compared against k predecessors, so later frames almost always find a closer match and
+    score lower. Measured, corr(frame_id, transition) = -0.25 and mean novelty falls 12x
+    from the first 20 frames to frames 80-99. Frozen, that inflated early-frame score is
+    never revised, which is why the retained cache skews old (median token age 54 where a
+    uniform policy gives 35).
+
+    Scoring every frame against the whole set removes the bias, because all frames now
+    face the same population: the result is "how unique is this viewpoint among everywhere
+    we have been", recomputed each step rather than fixed on arrival.
+    """
+    if len(descriptors) < 2:
+        return descriptors[0].new_zeros((len(descriptors),), dtype=torch.float32)
+    d = torch.stack([x.to(descriptors[-1].device) for x in descriptors]).float()
+    cosine = (d @ d.T).clamp(-1, 1)
+    cosine.fill_diagonal_(-1.0)          # a frame is not its own neighbour
+    return ((1 - cosine.max(dim=1).values) * 0.5).clamp(0, 1)
+
+
 def concat_metadata(old, new):
     if old is None:
         return new

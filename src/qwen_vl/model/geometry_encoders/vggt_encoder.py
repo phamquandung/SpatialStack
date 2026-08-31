@@ -111,6 +111,7 @@ class VGGTEncoder(BaseGeometryEncoder):
         )
         self._vln_instruction_state = None
         self._vln_transition_state = None
+        self._vln_frame_descriptors = None
         self._vln_metadata_per_layer = None
         self._vln_layer_budgets = None
         self._vln_score_probe = None
@@ -179,6 +180,7 @@ class VGGTEncoder(BaseGeometryEncoder):
         self._vln_metadata_per_layer = None
         if self._vln_transition_state is not None:
             self._vln_transition_state.reset()
+        self._vln_frame_descriptors = []
         self.last_vggt_ms = 0.0
         self._frame_feature_buffer = [] if self._eval_frame_strict else None
         self._eval_window_indices = None
@@ -194,6 +196,7 @@ class VGGTEncoder(BaseGeometryEncoder):
         self._load_vggt_configs()
         transition_cfg = self.vln_segment_transition_weights["transition"]
         self._vln_instruction_state = state
+        self._vln_frame_descriptors = []
         self._vln_transition_state = RecentTransitionState(
             max_frames=int(transition_cfg["recent_window_size"])
         )
@@ -238,6 +241,7 @@ class VGGTEncoder(BaseGeometryEncoder):
             build_frame_descriptor,
             compute_instruction_segment_relevance,
             compute_local_transition_score,
+            compute_cache_novelty,
             compute_transition_anchor,
             compute_candidate_final_score,
             concat_metadata,
@@ -413,6 +417,14 @@ class VGGTEncoder(BaseGeometryEncoder):
                 best_segment=best_segment,
             )
 
+        # Re-score every seen frame against the same reference population, once per step.
+        # Freezing novelty at insertion bakes in a when-did-this-arrive bias that never
+        # gets revised; recomputing removes it. Cheap: one [F,F] cosine on 1024-d unit
+        # descriptors, F <= episode length.
+        cache_novelty = None
+        if transition_cfg.get("novelty_ref", "insertion") == "cache":
+            cache_novelty = compute_cache_novelty(self._vln_frame_descriptors)
+
         depth_layers = len(self._streaming_past_key_values)
         if self._vln_metadata_per_layer is None:
             self._vln_metadata_per_layer = [None] * depth_layers
@@ -429,6 +441,11 @@ class VGGTEncoder(BaseGeometryEncoder):
                     f"{candidate_meta.final_score.numel()}"
                 )
             layer_budget = int(self._vln_layer_budgets[layer_idx])
+            if cache_novelty is not None:
+                refreshed = cache_novelty[candidate_meta.frame_id.long()]
+                candidate_meta.transition_score = (
+                    refreshed * (~candidate_meta.is_special.bool())
+                ).to(candidate_meta.transition_score.dtype)
             candidate_meta.final_score, normalized_components = compute_candidate_final_score(
                 candidate_meta,
                 score_weights,
@@ -501,6 +518,8 @@ class VGGTEncoder(BaseGeometryEncoder):
         # dtype only to cast it back (and re-normalise) next frame loses precision on a
         # cosine that consecutive VLN frames drive to within ~1e-3 of each other.
         self._vln_transition_state.descriptors.append(descriptor.detach())
+        if self._vln_frame_descriptors is not None:
+            self._vln_frame_descriptors.append(descriptor.detach())
         # Only the immediately previous pose is needed next frame. Drop old dense
         # depth/confidence maps so this scorer does not create an unbounded side memory.
         if len(self._streaming_frame_metadata) > 2:
@@ -633,6 +652,18 @@ class VGGTEncoder(BaseGeometryEncoder):
         gate_mode = transition.get("gate", "blend")
         if gate_mode not in ("blend", "none"):
             raise ValueError(f"{path}: transition.gate must be 'blend' or 'none'")
+        novelty_ref = transition.get("novelty_ref", "insertion")
+        if novelty_ref not in ("insertion", "cache"):
+            raise ValueError(
+                f"{path}: transition.novelty_ref must be 'insertion' or 'cache'"
+            )
+        if novelty_ref == "cache" and gate_mode != "none":
+            # The stored score is T * gate, and the per-token gate of past frames is not
+            # kept, so a refreshed T cannot be recombined with it. Recomputing therefore
+            # requires the ungated form.
+            raise ValueError(
+                f"{path}: transition.novelty_ref='cache' requires transition.gate='none'"
+            )
         gate_names = ("confidence_gate_weight", "instruction_gate_weight")
         if gate_mode == "none":
             # The weights are unused here, so accepting them silently would let a config
