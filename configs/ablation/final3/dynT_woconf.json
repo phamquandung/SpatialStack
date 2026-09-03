@@ -1,0 +1,27 @@
+{
+  "score_mode": "vln_segment_transition",
+  "score_weights": {
+    "geometry": 0.0,
+    "confidence": 0.0,
+    "instruction": 0.5,
+    "transition": 0.5,
+    "recency": 0.0
+  },
+  "geometry_weights": {
+    "camera_pose_change": 0.5,
+    "depth_structure": 0.5
+  },
+  "confidence": {
+    "merge": "min"
+  },
+  "normalization": {
+    "candidate_terms": "zscore"
+  },
+  "transition": {
+    "recent_window_size": 400,
+    "descriptor_pooling": "uniform",
+    "novelty_reduce": "max",
+    "gate": "none",
+    "novelty_ref": "cache"
+  }
+}
