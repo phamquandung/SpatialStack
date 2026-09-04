@@ -2,7 +2,7 @@
 #SBATCH --job-name=spatialstack-janus-vln
 #SBATCH --output=logs/spatialstack_janus_vln_%j.log
 #SBATCH --error=logs/spatialstack_janus_vln_%j.err
-#SBATCH --nodelist=worker-0
+#SBATCH --nodelist=worker-1
 #SBATCH --gpus=8
 #SBATCH --cpus-per-task=120
 #SBATCH --mem-per-cpu=8192
@@ -36,18 +36,18 @@ fi
 
 # --- VLN data (JanusVLN layout on shared storage) ---
 export VLN_DATA_ROOT="${VLN_DATA_ROOT:-/mnt/data/vmo-ai-task/anhdh35/JanusVLN}"
-export VLN_ANNOTATION="${VLN_ANNOTATION:-/mnt/data/vmo-ai-task/anhdh35/JanusVLN/train_r2r_rxr.json}"
+export VLN_ANNOTATION="${VLN_ANNOTATION:-/mnt/data/vmo-ai-task/anhdh35/JanusVLN/train_merged.json}"
 
 # --- Model checkpoints ---
 export VLN_TRAIN_MODE="${VLN_TRAIN_MODE:-train}"   # train | finetune
-export MODEL_PATH="${MODEL_PATH:-/mnt/data/vmo-ai-task/dungpq6/model-checkpoint/Qwen3.5-4B}"
+export MODEL_PATH="${MODEL_PATH:-/mnt/data/vmo-ai-task/dungpq6/model-checkpoint/spatialstack_janus_vln_train-gate-scale-4B-loss-3/model}"
 export GEOMETRY_ENCODER_PATH="${GEOMETRY_ENCODER_PATH:-/mnt/data/vmo-ai-task/dungpq6/model-checkpoint/VGGT-1B}"
 
 # --- Training hyperparameters (passed through to train_janus_vln.sh) ---
-export DATASETS="${DATASETS:-train_r2r_rxr%100}"
+export DATASETS="${DATASETS:-train_r2r_rxr_extra%100}"
 export TOTAL_BATCH_SIZE="${TOTAL_BATCH_SIZE:-64}"
 export LR="${LR:-2e-5}"
-export OUTPUT_DIR="${OUTPUT_DIR:-/mnt/data/vmo-ai-task/dungpq6/model-checkpoint/spatialstack_janus_vln_train-gate-scale}"   # fresh dir per recipe (avoid resuming the old run)
+export OUTPUT_DIR="${OUTPUT_DIR:-/mnt/data/vmo-ai-task/dungpq6/model-checkpoint/spatialstack_janus_vln_train-gate-scale-4B-loss-3-extra-extra}"   # fresh dir per recipe (avoid resuming the old run)
 export CACHE_DIR="${CACHE_DIR:-${PROJECT_ROOT}/cache}"
 
 # --- Geometry fusion recipe (STOP-collapse fix) ---
@@ -61,7 +61,7 @@ export GEOMETRY_IMPORTANCE_GATE="${GEOMETRY_IMPORTANCE_GATE:-true}"    # Step 2'
 export GEOMETRY_LEARNABLE_SCALE="${GEOMETRY_LEARNABLE_SCALE:-true}"    # Step 2'' fusion migration: learnable per-layer geometry scale (default off)
 export FEATURE_FUSION_METHOD="${FEATURE_FUSION_METHOD:-deepstack_language_add}"  # deepstack_language_add (Steps 1/2'/2'') | deepstack_language_sgf (Step 2 cross-attn + 3/4)
 export GEOMETRY_SPATIAL_BIAS="${GEOMETRY_SPATIAL_BIAS:-false}"          # Step 4 fusion migration: spatial-distance bias on SGF cross-attn (default off)
-export STOP_LOSS_WEIGHT="${STOP_LOSS_WEIGHT:-1}"                        # 1 = none (JanusVLN handles the 1.26% STOP imbalance unweighted); raise only if STOP still under-fires
+export STOP_LOSS_WEIGHT="${STOP_LOSS_WEIGHT:-3}"                        # 1 = none (JanusVLN handles the 1.26% STOP imbalance unweighted); raise only if STOP still under-fires
 
 # --- Weights & Biases (offline; sync later with `wandb sync`) ---
 export REPORT_TO="${REPORT_TO:-wandb}"

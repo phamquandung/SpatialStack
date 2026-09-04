@@ -29,8 +29,13 @@ if [ "${NPROC_PER_NODE}" -lt 1 ]; then
 fi
 
 # ---- model / geometry (SpatialStack checkpoint — NOT a JanusVLN one) ----
+<<<<<<< HEAD
 CHECKPOINT="${CHECKPOINT:-/media/vmo-perception/disk_2/vinhld8/checkpoints/spatialstack_janus_vln_train-gate-scale-4B-loss-3}"
 GEOMETRY_ENCODER_PATH="${GEOMETRY_ENCODER_PATH:-/media/vmo-perception/disk_2/vinhld8/checkpoints/VGGT-1B}"
+=======
+CHECKPOINT="${CHECKPOINT:-/mnt/data/vmo-ai-task/dungpq6/model-checkpoint/spatialstack_janus_vln_train-gate-scale-4B-loss-3/model}"
+GEOMETRY_ENCODER_PATH="${GEOMETRY_ENCODER_PATH:-/mnt/data/vmo-ai-task/dungpq6/model-checkpoint/VGGT-1B}"
+>>>>>>> 62229ea (final)
 export GEOMETRY_ENCODER_PATH
 # Streaming VGGT KV window (must match how the checkpoint was trained/evaluated).
 export VGGT_KV_START="${VGGT_KV_START:-8}"
@@ -42,6 +47,7 @@ export VGGT_KV_RECENT="${VGGT_KV_RECENT:-48}"
 # R2R keeps Habitat-Lab's built-in R2RVLN-v1 loader. RxR uses the project-local
 # RxRVLNCE-v1 loader registered by src/habitat_extensions/task.py.
 DAGGER_DATASET="${DAGGER_DATASET:-R2R}"
+<<<<<<< HEAD
 case "${DAGGER_DATASET^^}" in
   R2R)
     DAGGER_DATA_PATH="${DAGGER_DATA_PATH:-/media/vmo-perception/disk_2/vinhld8/data/datasets/r2r/train/train.json.gz}"
@@ -58,6 +64,15 @@ case "${DAGGER_DATASET^^}" in
     exit 2
     ;;
 esac
+=======
+DAGGER_DATA_PATH="${DAGGER_DATA_PATH:-/mnt/data/vmo-ai-task/dungpq6/gt_CE/R2R_VLNCE_v1-3_preprocessed/train/train.json.gz}"
+DAGGER_GT_ANNOTATIONS_PATH="${DAGGER_GT_ANNOTATIONS_PATH:-/mnt/data/vmo-ai-task/dungpq6/gt_CE/R2R_VLNCE_v1-3_preprocessed/train/train_gt.json.gz}"
+
+# RxR example:
+#   DAGGER_DATASET=RxR
+#   DAGGER_DATA_PATH=.../rxr/train/train_guide_en.json.gz
+#   DAGGER_GT_ANNOTATIONS_PATH=.../rxr/train/train_guide_gt.json.gz
+>>>>>>> 62229ea (final)
 
 # ---- DAgger hyper-params ----
 DAGGER_UPDATE_SIZE="${DAGGER_UPDATE_SIZE:-160000}"   # max episodes to collect (across ranks)
@@ -66,8 +81,8 @@ DAGGER_P="${DAGGER_P:-0}"                             # 0 = pure model rollout w
 DAGGER_DATA_IT="${DAGGER_DATA_IT:-3}"                 # unused when DAGGER_P=0
 SAVE_VIDEO="${SAVE_VIDEO:-0}"
 
-DAGGER_OUTPUT_PATH="${DAGGER_OUTPUT_PATH:-data/dagger_data/${DAGGER_DATASET}}"
-OUTPUT_PATH="${OUTPUT_PATH:-results/dagger/${DAGGER_DATASET}}"
+DAGGER_OUTPUT_PATH="${DAGGER_OUTPUT_PATH:-/mnt/data/vmo-ai-task/dungpq6/gt_CE/data/dagger_data/${DAGGER_DATASET}}"
+OUTPUT_PATH="${OUTPUT_PATH:-/mnt/data/vmo-ai-task/dungpq6/gt_CE/results/dagger/${DAGGER_DATASET}}"
 mkdir -p "${DAGGER_OUTPUT_PATH}" "${OUTPUT_PATH}"
 
 echo "CHECKPOINT:            ${CHECKPOINT}"

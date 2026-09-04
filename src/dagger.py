@@ -42,6 +42,10 @@ sys.path.insert(0, os.path.abspath(os.path.dirname(__file__)))
 
 import torch
 import torch.distributed as dist
+<<<<<<< HEAD
+=======
+# from omegaconf import OmegaConf
+>>>>>>> 62229ea (final)
 from types import SimpleNamespace
 from PIL import Image
 
@@ -58,9 +62,12 @@ from habitat.utils.visualizations.utils import (
     images_to_video,
     observations_to_image,
 )
+<<<<<<< HEAD
 # Use habitat core's config loader (same as evaluation.py). Importing
 # habitat_baselines instead pulls in the visualization stack, which crashes on
 # import in some habitat-lab/numpy combos (maps.py squeeze error).
+=======
+>>>>>>> 62229ea (final)
 from habitat.config.default import get_config as get_habitat_config
 
 from habitat_extensions import measures, task  # noqa: F401  (registers extensions)
@@ -224,6 +231,16 @@ class DAggerCollector:
                 gpu_id = getattr(args, "local_rank", getattr(args, "gpu", 0))
                 self.config.habitat.simulator.habitat_sim_v0.gpu_device_id = gpu_id
 
+<<<<<<< HEAD
+=======
+        #self.dagger_config = OmegaConf.create(
+        #    {
+        #        "p": self.args.dagger_p,
+        #        "update_size": self.args.dagger_update_size,
+        #        "commit_freq": self.args.dagger_commit_freq,
+        #    }
+        #)
+>>>>>>> 62229ea (final)
         self.dagger_config = SimpleNamespace(
             p=self.args.dagger_p,
             update_size=self.args.dagger_update_size,

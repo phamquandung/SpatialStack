@@ -15,7 +15,7 @@ cd "$SPATIAL_ROOT"
 # Data paths (relative to SpatialStack root by default)
 # ======================
 export VLN_DATA_ROOT="${VLN_DATA_ROOT:-/mnt/data/vmo-ai-task/anhdh35/JanusVLN}"
-export VLN_ANNOTATION="${VLN_ANNOTATION:-/mnt/data/vmo-ai-task/anhdh35/JanusVLN/train_r2r_rxr.json}"
+export VLN_ANNOTATION="${VLN_ANNOTATION:-/mnt/data/vmo-ai-task/anhdh35/JanusVLN/train_merged.json}"
 
 if [[ "$VLN_ANNOTATION" != /* ]]; then
     ANNOTATION_FILE="$SPATIAL_ROOT/$VLN_ANNOTATION"
@@ -79,8 +79,8 @@ else
     if [[ "$VLN_TRAIN_MODE" != "train" ]]; then
         echo "WARNING: unknown VLN_TRAIN_MODE='$VLN_TRAIN_MODE', using train (Qwen3.5 base)"
     fi
-    MODEL_PATH="${MODEL_PATH:-/mnt/data/vmo-ai-task/dungpq6/model-checkpoint/Qwen3.5-4B}"
-    OUTPUT_DIR="${OUTPUT_DIR:-/mnt/data/vmo-ai-task/dungpq6/model-checkpoint/spatialstack_janus_vln_train-gate-scale}"
+    MODEL_PATH="${MODEL_PATH:-/mnt/data/vmo-ai-task/dungpq6/model-checkpoint/spatialstack_janus_vln_train-gate-scale-4B-loss-3/model}"
+    OUTPUT_DIR="${OUTPUT_DIR:-/mnt/data/vmo-ai-task/dungpq6/model-checkpoint/spatialstack_janus_vln_train-gate-scale-4B-loss-3-extra}"
 fi
 
 GEOMETRY_ENCODER_PATH="${GEOMETRY_ENCODER_PATH:-/mnt/data/vmo-ai-task/dungpq6/model-checkpoint/VGGT-1B}"
@@ -113,10 +113,10 @@ GEOMETRY_FRAME_STRICT="${GEOMETRY_FRAME_STRICT:-true}" # Step 1: per-frame geome
 GEOMETRY_IMPORTANCE_GATE="${GEOMETRY_IMPORTANCE_GATE:-true}" # Step 2': per-position gate suppressing background geometry (default off)
 GEOMETRY_LEARNABLE_SCALE="${GEOMETRY_LEARNABLE_SCALE:-true}" # Step 2'': learnable per-layer geometry scale, init = fusion_scale (default off)
 GEOMETRY_SPATIAL_BIAS="${GEOMETRY_SPATIAL_BIAS:-false}"       # Step 4: spatial-distance bias (only used when FEATURE_FUSION_METHOD=deepstack_language_sgf)
-STOP_LOSS_WEIGHT="${STOP_LOSS_WEIGHT:-1.0}"            # up-weight STOP tokens in LM loss (exposure-bias fix)
+STOP_LOSS_WEIGHT="${STOP_LOSS_WEIGHT:-3.0}"            # up-weight STOP tokens in LM loss (exposure-bias fix)
 REPORT_TO="${REPORT_TO:-none}"
 
-DATALOADER_NUM_WORKERS="${DATALOADER_NUM_WORKERS:-8}"
+DATALOADER_NUM_WORKERS="${DATALOADER_NUM_WORKERS:-4}"
 VLN_DEBUG="${VLN_DEBUG:-false}"   # opt-in: set VLN_DEBUG=true only for smoke (forces num_workers=0 + saves frames -> slow)
 VLN_DEBUG_DEPTH="${VLN_DEBUG_DEPTH:-true}"
 if [[ "$VLN_DEBUG" == "1" || "${VLN_DEBUG,,}" == "true" ]]; then

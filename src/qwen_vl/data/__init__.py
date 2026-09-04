@@ -131,22 +131,27 @@ JANUS_VLN_EXTRA = {
 }
 
 JANUS_VLN_BASE = {
-    "annotation_path": _VLN_ANNOTATION_OVERRIDE or "data/train/train_r2r_rxr.json",
+    "annotation_path": _VLN_ANNOTATION_OVERRIDE or "data/train/train_r2r_rxr_15deg.json",
     "data_path": _VLN_DATA_ROOT,
     "tag": "3d",
 }
 
 # JanusVLN-compatible names (same JSON layout; paths via VLN_DATA_ROOT / VLN_ANNOTATION)
 TRAIN_R2R_RXR = {
-    "annotation_path": "/mnt/data/vmo-ai-task/anhdh35/JanusVLN/train_r2r_rxr.json",
+    "annotation_path": "/mnt/data/vmo-ai-task/anhdh35/JanusVLN/train_r2r_rxr_15deg.json",
+    "data_path": "/mnt/data/vmo-ai-task/anhdh35/JanusVLN",
+    "tag": "3d",
+}
+
+TRAIN_R2R = {
+    "annotation_path": "/mnt/data/vmo-ai-task/anhdh35/JanusVLN/train_r2r.json",
     "data_path": "/mnt/data/vmo-ai-task/anhdh35/JanusVLN",
     "tag": "3d",
 }
 
 TRAIN_R2R_RXR_EXTRA = {
-    "annotation_path": _VLN_ANNOTATION_OVERRIDE
-    or os.path.join(_VLN_DATA_ROOT, "train_r2r_rxr_extra.json"),
-    "data_path": _VLN_DATA_ROOT,
+    "annotation_path": "/mnt/data/vmo-ai-task/anhdh35/JanusVLN/train_merged.json",
+    "data_path": "/mnt/data/vmo-ai-task/anhdh35/JanusVLN",
     "tag": "3d",
 }
 
@@ -168,6 +173,7 @@ data_dict = {
     "janus_vln_base": JANUS_VLN_BASE,
     "train_r2r_rxr": TRAIN_R2R_RXR,
     "train_r2r_rxr_extra": TRAIN_R2R_RXR_EXTRA,
+    "train_r2r": TRAIN_R2R
 }
 
 
