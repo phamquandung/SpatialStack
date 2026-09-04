@@ -301,8 +301,19 @@ class VGGTEncoder(BaseGeometryEncoder):
         patch_start_idx = 0
         # FUSION_FRAME_STRICT: keep every frame's geometry (each frame fused with its
         # own vision tokens) instead of only the last frame (broadcast to all frames).
-        # per_frame_layers stays None for the non-strict path, which is unchanged.
-        per_frame_layers = {idx: [] for idx in layer_indices} if frame_strict else None
+        # Accumulate each *unique* encoder layer once per frame. ``layer_indices`` may
+        # intentionally contain duplicates (for example [23, 23, 23] to feed the same
+        # VGGT layer into three decoder fusion layers). Iterating over layer_indices
+        # here would append that output three times per frame and corrupt the channel
+        # dimension when the frames are reshaped below.
+        #
+        # The output loop still follows the original layer_indices, so duplicate
+        # requests produce duplicate feature entries in the expected order.
+        per_frame_layers = (
+            {idx: [] for idx in dict.fromkeys(layer_indices)}
+            if frame_strict
+            else None
+        )
 
         with torch.no_grad():
             with torch.cuda.amp.autocast(dtype=dtype):
@@ -316,7 +327,7 @@ class VGGTEncoder(BaseGeometryEncoder):
                     )
                     aggregated_tokens_list, patch_start_idx, past_key_values = output
                     if frame_strict:
-                        for idx in layer_indices:
+                        for idx in per_frame_layers:
                             per_frame_layers[idx].append(aggregated_tokens_list[idx])
 
         tensor_features = []
@@ -327,6 +338,12 @@ class VGGTEncoder(BaseGeometryEncoder):
                 frame_tokens = torch.cat(
                     [lo[0, -1:, patch_start_idx:, :] for lo in per_frame_layers[idx]], dim=0
                 )
+                if frame_tokens.shape[0] != n_image:
+                    raise RuntimeError(
+                        "Frame-strict VGGT feature count does not match the input "
+                        f"frame count for layer {idx}: got {frame_tokens.shape[0]}, "
+                        f"expected {n_image}. Requested layers: {layer_indices}."
+                    )
                 camera_token = (
                     torch.cat([lo[0, -1:, 0:1, :] for lo in per_frame_layers[idx]], dim=0)
                     if include_camera_token
