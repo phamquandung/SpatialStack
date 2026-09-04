@@ -125,7 +125,9 @@ class VGGTEncoder(BaseGeometryEncoder):
                 f"{self.vggt_total_budget}"
             )
         self.vggt_importance_weights_path = config.vggt_importance_weights_path
-        self.vggt_budget_proportions_path = config.vggt_budget_proportions_path
+        self.vggt_budget_proportions_path = os.environ.get(
+            "VGGT_BUDGET_PROPORTIONS_PATH", config.vggt_budget_proportions_path
+        )
         self.vln_segment_transition_weights_path = os.environ.get(
             "VLN_SEGMENT_TRANSITION_WEIGHTS_PATH",
             config.vln_segment_transition_weights_path,
@@ -591,8 +593,24 @@ class VGGTEncoder(BaseGeometryEncoder):
         if proportions_path is not None:
             with open(proportions_path) as f:
                 cfg = json.load(f)
+            proportions = cfg["proportions"]
+            depth = int(self.vggt.aggregator.depth)
+            if len(proportions) != depth:
+                raise ValueError(
+                    f"{proportions_path}: expected {depth} proportions, "
+                    f"got {len(proportions)}"
+                )
+            if abs(sum(float(x) for x in proportions) - 1.0) > 1e-4:
+                raise ValueError(
+                    f"{proportions_path}: proportions must sum to 1, "
+                    f"got {sum(float(x) for x in proportions):.6f}"
+                )
             self.vggt.aggregator.budget_proportions = torch.tensor(
-                cfg["proportions"], dtype=torch.float32
+                proportions, dtype=torch.float32
+            )
+            print(
+                f"[VGGTEncoder] layer budget proportions: {proportions_path} "
+                f"(min {min(proportions):.4f}, max {max(proportions):.4f})"
             )
         if self.use_vln_segment_transition:
             vln_weights_path = self._resolve_config_path(
