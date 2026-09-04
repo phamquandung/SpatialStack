@@ -15,7 +15,7 @@ cd "$SPATIAL_ROOT"
 # Data paths (relative to SpatialStack root by default)
 # ======================
 export VLN_DATA_ROOT="${VLN_DATA_ROOT:-/mnt/data/vmo-ai-task/anhdh35/JanusVLN}"
-export VLN_ANNOTATION="${VLN_ANNOTATION:-/mnt/data/vmo-ai-task/anhdh35/JanusVLN/train_merged.json}"
+export VLN_ANNOTATION="${VLN_ANNOTATION:-/mnt/data/vmo-ai-task/anhdh35/JanusVLN/train_r2r_rxr.json}"
 
 if [[ "$VLN_ANNOTATION" != /* ]]; then
     ANNOTATION_FILE="$SPATIAL_ROOT/$VLN_ANNOTATION"
@@ -79,8 +79,8 @@ else
     if [[ "$VLN_TRAIN_MODE" != "train" ]]; then
         echo "WARNING: unknown VLN_TRAIN_MODE='$VLN_TRAIN_MODE', using train (Qwen3.5 base)"
     fi
-    MODEL_PATH="${MODEL_PATH:-/mnt/data/vmo-ai-task/dungpq6/model-checkpoint/spatialstack_janus_vln_train-gate-scale-4B-loss-3/model}"
-    OUTPUT_DIR="${OUTPUT_DIR:-/mnt/data/vmo-ai-task/dungpq6/model-checkpoint/spatialstack_janus_vln_train-gate-scale-4B-loss-3-extra}"
+    MODEL_PATH="${MODEL_PATH:-/mnt/data/vmo-ai-task/dungpq6/model-checkpoint/Qwen3.5-4B}"
+    OUTPUT_DIR="${OUTPUT_DIR:-/mnt/data/vmo-ai-task/dungpq6/model-checkpoint/spatialstack_janus_VGGT-Deep}"
 fi
 
 GEOMETRY_ENCODER_PATH="${GEOMETRY_ENCODER_PATH:-/mnt/data/vmo-ai-task/dungpq6/model-checkpoint/VGGT-1B}"
@@ -106,7 +106,7 @@ USE_GEOMETRY_ENCODER="${USE_GEOMETRY_ENCODER:-true}"
 GEOMETRY_ENCODER_STREAMING="${GEOMETRY_ENCODER_STREAMING:-true}"
 FEATURE_FUSION_METHOD="${FEATURE_FUSION_METHOD:-deepstack_language_add}"
 GEOMETRY_FUSION_LAYERS="${GEOMETRY_FUSION_LAYERS:-0 1 2}"
-GEOMETRY_ENCODER_LAYERS="${GEOMETRY_ENCODER_LAYERS:-11 17 23}"
+GEOMETRY_ENCODER_LAYERS="${GEOMETRY_ENCODER_LAYERS:-23 23 23}"
 REFERENCE_FRAME="${REFERENCE_FRAME:-first}"
 GEOMETRY_FUSION_SCALE="${GEOMETRY_FUSION_SCALE:-0.5}"   # JanusVLN-style lam on geometry delta (saved to config)
 GEOMETRY_FRAME_STRICT="${GEOMETRY_FRAME_STRICT:-true}" # Step 1: per-frame geometry vs last-frame broadcast (default off = baseline)

@@ -138,7 +138,7 @@ JANUS_VLN_BASE = {
 
 # JanusVLN-compatible names (same JSON layout; paths via VLN_DATA_ROOT / VLN_ANNOTATION)
 TRAIN_R2R_RXR = {
-    "annotation_path": "/mnt/data/vmo-ai-task/anhdh35/JanusVLN/train_r2r_rxr_15deg.json",
+    "annotation_path": "/mnt/data/vmo-ai-task/anhdh35/JanusVLN/train_r2r_rxr.json",
     "data_path": "/mnt/data/vmo-ai-task/anhdh35/JanusVLN",
     "tag": "3d",
 }
