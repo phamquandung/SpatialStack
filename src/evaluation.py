@@ -26,7 +26,7 @@ from habitat.config.default_structured_configs import (
 )
 from habitat.utils.visualizations.utils import images_to_video, observations_to_image
 
-from habitat_extensions import measures  # noqa: F401
+from habitat_extensions import measures, task  # noqa: F401
 from utils.dist import get_rank, get_world_size, init_distributed_mode
 from qwen_vl.model.modeling_qwen3_5 import Qwen3_5ForConditionalGenerationWithGeometry
 

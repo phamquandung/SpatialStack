@@ -1,12 +1,14 @@
 import gzip
 import json
 import pickle
+from dataclasses import dataclass
 from typing import Any, List, Union, Optional, Tuple
 import numpy as np
 # from dtw import dtw
 # from fastdtw import fastdtw
 # from habitat.config import Config
 from habitat.core.dataset import Episode
+from habitat.config.default_structured_configs import MeasurementConfig
 from habitat.core.embodied_task import Action, EmbodiedTask, Measure
 from habitat.core.logging import logger
 from habitat.core.registry import registry
@@ -19,6 +21,7 @@ from habitat.utils.visualizations import fog_of_war
 from habitat.utils.visualizations import maps as habitat_maps
 from numpy import ndarray
 from omegaconf import DictConfig
+from hydra.core.config_store import ConfigStore
 # from utils import maps
 # from habitat_extensions.task import RxRVLNCEDatasetV1
 
@@ -96,7 +99,6 @@ class OracleSuccess(Measure):
     #     super().__init__()
 
     def __init__(self, *args: Any, config: Any, **kwargs: Any):
-        print(f"in oracle success init: args = {args}, kwargs = {kwargs}")
         self._config = config
         super().__init__()
 
@@ -113,7 +115,9 @@ class OracleSuccess(Measure):
     def update_metric(self, *args: Any, task: EmbodiedTask, **kwargs: Any):
         d = task.measurements.measures[DistanceToGoal.cls_uuid].get_metric()
         # self._metric = float(self._metric or d < self._config["success_distance"])
-        self._metric = float(self._metric or d < 3.0)
+        self._metric = float(
+            self._metric or d < self._config.success_distance
+        )
 
 
 @registry.register_measure
@@ -232,7 +236,12 @@ class NDTW(Measure):
         from fastdtw import fastdtw
 
         self.dtw_func = fastdtw
-        self.gt_path = "data/datasets/rxr/val_unseen/val_unseen_guide_gt.json.gz"
+        dataset = kwargs.get("dataset")
+        dataset_config = getattr(dataset, "config", None)
+        split = getattr(dataset_config, "split", "val_unseen")
+        roles = list(getattr(dataset_config, "roles", ["guide"]))
+        role = roles[0] if roles else "guide"
+        self.gt_path = config.gt_path.format(split=split, role=role)
         with gzip.open(self.gt_path, "rt") as f:
             self.gt_json = json.load(f)
         super().__init__()
@@ -242,7 +251,7 @@ class NDTW(Measure):
 
     def reset_metric(self, *args: Any, episode, **kwargs: Any):
         self.locations = []
-        self.gt_locations = self.gt_json[episode.episode_id]["locations"]
+        self.gt_locations = self.gt_json[str(episode.episode_id)]["locations"]
         self.update_metric()
 
     def update_metric(self, *args: Any, **kwargs: Any):
@@ -253,8 +262,37 @@ class NDTW(Measure):
         dtw_distance = self.dtw_func(
             self.locations, self.gt_locations, dist=euclidean_distance
         )[0]
-        # The scale factor (3.0) is based on the default VLN-CE config.
-        nDTW = np.exp(-dtw_distance / (len(self.gt_locations) * 3.0))
+        nDTW = np.exp(
+            -dtw_distance
+            / (len(self.gt_locations) * self._config.success_distance)
+        )
         self._metric = nDTW
 
+
+@dataclass
+class OracleSuccessMeasurementConfig(MeasurementConfig):
+    type: str = "OracleSuccess"
+    success_distance: float = 3.0
+
+
+@dataclass
+class NDTWMeasurementConfig(MeasurementConfig):
+    type: str = "NDTW"
+    success_distance: float = 3.0
+    gt_path: str = ""
+
+
+config_store = ConfigStore.instance()
+config_store.store(
+    package="habitat.task.measurements.oracle_success",
+    group="habitat/task/measurements",
+    name="oracle_success",
+    node=OracleSuccessMeasurementConfig,
+)
+config_store.store(
+    package="habitat.task.measurements.ndtw",
+    group="habitat/task/measurements",
+    name="ndtw",
+    node=NDTWMeasurementConfig,
+)
 
