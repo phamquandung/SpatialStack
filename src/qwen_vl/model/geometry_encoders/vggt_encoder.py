@@ -300,10 +300,14 @@ class VGGTEncoder(BaseGeometryEncoder):
         else:
             confidence = torch.minimum(depth_c, point_c)
 
-        relevance, best_segment = compute_instruction_segment_relevance(
-            visual, self._vln_instruction_state.segment_embeddings.to(device)
-        )
         transition_cfg = self.vln_segment_transition_weights["transition"]
+        relevance, best_segment = compute_instruction_segment_relevance(
+            visual,
+            self._vln_instruction_state.segment_embeddings.to(device),
+            centering=self.vln_segment_transition_weights.get("instruction", {}).get(
+                "centering", "none"
+            ),
+        )
         descriptor = build_frame_descriptor(
             visual, confidence,
             pooling=transition_cfg.get("descriptor_pooling", "confidence"),
@@ -664,6 +668,13 @@ class VGGTEncoder(BaseGeometryEncoder):
         if normalization.get("candidate_terms") not in ("zscore", "sigmoid"):
             raise ValueError(
                 f"{path}: normalization.candidate_terms must be 'zscore' or 'sigmoid'"
+            )
+        instruction_cfg = config.get("instruction", {})
+        if not isinstance(instruction_cfg, dict):
+            raise ValueError(f"{path}: instruction must be an object")
+        if instruction_cfg.get("centering", "none") not in ("none", "both"):
+            raise ValueError(
+                f"{path}: instruction.centering must be 'none' or 'both'"
             )
         transition = config.get("transition", {})
         window = transition.get("recent_window_size")

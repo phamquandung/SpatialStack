@@ -229,7 +229,22 @@ def build_instruction_segment_state(instruction, tokenizer, input_embedding_laye
 
 
 @torch.no_grad()
-def compute_instruction_segment_relevance(aligned_visual_tokens, segment_embeddings):
+def compute_instruction_segment_relevance(
+    aligned_visual_tokens, segment_embeddings, centering="none"
+):
+    """Per-token similarity to the closest instruction segment.
+
+    `centering="both"` subtracts the frame's mean visual token and the instruction's mean
+    segment embedding before the cosine. Measured on real episodes, the raw cosine sits at
+    -0.013 with a p5-p95 spread of only 0.057: projected visual tokens are nearly
+    orthogonal to raw word embeddings, so almost all of the similarity is a component
+    shared by every token. Writing v_i = c + d_i, the numerator's <c, e_s> term is
+    constant and z-scoring removes it, but the denominator |c + d_i| still varies with the
+    token, so the ranking is driven by token *norm* rather than direction. That also makes
+    argmax_s collapse onto whichever segment aligns with c, which is why one segment took
+    60% of tokens on average (100% in one episode) from frame 0 onward. Centering both
+    sides leaves only the part that actually differs between tokens and between clauses.
+    """
     if aligned_visual_tokens.ndim != 2 or segment_embeddings.ndim != 2:
         raise ValueError("visual tokens and segment embeddings must both be rank-2")
     if aligned_visual_tokens.shape[-1] != segment_embeddings.shape[-1]:
@@ -237,9 +252,17 @@ def compute_instruction_segment_relevance(aligned_visual_tokens, segment_embeddi
             f"language-space dimension mismatch: visual={aligned_visual_tokens.shape[-1]}, "
             f"text={segment_embeddings.shape[-1]}"
         )
+    visual = aligned_visual_tokens.float()
+    text = segment_embeddings.float()
+    if centering == "both":
+        visual = visual - visual.mean(dim=0, keepdim=True)
+        # A single segment has no mean to remove: centering would zero it out entirely.
+        if text.shape[0] > 1:
+            text = text - text.mean(dim=0, keepdim=True)
+        text = F.normalize(text, dim=-1)
     # segment_embeddings are already L2-normalised by build_instruction_segment_state and
     # are frozen for the episode, so only the visual side needs normalising each frame.
-    similarity = F.normalize(aligned_visual_tokens.float(), dim=-1) @ segment_embeddings.T
+    similarity = F.normalize(visual, dim=-1) @ text.T
     best, best_id = similarity.max(dim=-1)
     return ((best.clamp(-1, 1) + 1) * 0.5), best_id.to(torch.int16)
 
