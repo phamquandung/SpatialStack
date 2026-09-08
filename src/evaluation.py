@@ -529,7 +529,7 @@ class VLNEvaluator:
         for episode in env.episodes:
             scene_episode_dict.setdefault(episode.scene_id, []).append(episode)
 
-        sucs, spls, oss, ones = [], [], [], []
+        sucs, spls, oss, ones, ndtws = [], [], [], [], []
         done_res = []
         result_path = os.path.join(self.output_path, "result.json")
         if os.path.exists(result_path):
@@ -548,6 +548,7 @@ class VLNEvaluator:
                         spls.append(res["spl"])
                         oss.append(res["os"])
                         ones.append(res["ne"])
+                        ndtws.append(res.get("ndtw", -1.0))
 
         for scene in sorted(scene_episode_dict.keys()):
             episodes = scene_episode_dict[scene]
@@ -606,6 +607,8 @@ class VLNEvaluator:
                         continue
                     gt_actions = gt_entry["actions"]
 
+                ep_actions = []
+                ep_positions = []
                 while not env.episode_over:
                     if self.teacher_forced and step_id >= len(gt_actions):
                         break
@@ -671,6 +674,8 @@ class VLNEvaluator:
                         if step_id >= self.args.max_steps - 1:
                             action = 0
 
+                    ep_actions.append(int(action))
+                    ep_positions.append(_agent_xyz(env))
                     observations = env.step(action)
                     step_id += 1
 
@@ -679,6 +684,7 @@ class VLNEvaluator:
                     # spreads across the whole path, matching training. Destructively
                     # pruning here froze history to the first 8 frames + current.
 
+                ep_positions.append(_agent_xyz(env))
                 process_bar.update(1)
                 metrics = env.get_metrics()
                 if should_save_video:
@@ -690,13 +696,16 @@ class VLNEvaluator:
                         quality=9,
                     )
                 vis_frames.clear()
+                ep_ndtw = float(metrics.get("ndtw", -1.0))
                 sucs.append(metrics["success"])
                 spls.append(metrics["spl"])
                 oss.append(metrics["oracle_success"])
                 ones.append(metrics["distance_to_goal"])
+                ndtws.append(ep_ndtw)
                 print(
                     f"scene_episode {scene_id}_{episode_id} success: {metrics['success']}, "
                     f"spl: {metrics['spl']}, os: {metrics['oracle_success']}, ne: {metrics['distance_to_goal']}"
+                    + (f", ndtw: {ep_ndtw}" if ep_ndtw >= 0 else "")
                 )
                 result = {
                     "scene_id": scene_id,
@@ -705,7 +714,10 @@ class VLNEvaluator:
                     "spl": metrics["spl"],
                     "os": metrics["oracle_success"],
                     "ne": metrics["distance_to_goal"],
+                    "ndtw": ep_ndtw,
                     "steps": step_id,
+                    "actions": ep_actions,
+                    "positions": ep_positions,
                     "episode_instruction": episode_instruction,
                     "peak_vggt_kv_mb": ep_peak_vggt_kv,
                     "peak_vggt_camera_kv_mb": ep_peak_vggt_camera_kv,
@@ -735,8 +747,30 @@ class VLNEvaluator:
             torch.tensor(spls).to(self.device),
             torch.tensor(oss).to(self.device),
             torch.tensor(ones).to(self.device),
+            torch.tensor(ndtws).to(self.device),
             torch.tensor(len(sucs)).to(self.device),
         )
+
+
+def _agent_xyz(env):
+    """Agent position, rounded to 0.1mm — far finer than the 3m success radius."""
+    return [round(float(v), 4) for v in env.sim.get_agent_state().position]
+
+
+def summarize_ndtw(ndtws):
+    """Average nDTW over episodes that actually have it.
+
+    -1 marks "not measured": R2R does not configure the measure, and episodes
+    resumed from a result.json written before nDTW was recorded have no value.
+    Those are excluded rather than averaged in as zeros.
+    """
+    valid = ndtws[ndtws >= 0]
+    if valid.numel() == 0:
+        return {}
+    return {
+        "ndtw_all": (valid.sum() / valid.numel()).item(),
+        "ndtw_length": valid.numel(),
+    }
 
 
 def evaluate(model, args, scene_filter=None):
@@ -751,7 +785,7 @@ def evaluate(model, args, scene_filter=None):
         args=args,
         scene_filter=scene_filter,
     )
-    sucs, spls, oss, ones, ep_num = evaluator.eval_action(get_rank())
+    sucs, spls, oss, ones, ndtws, ep_num = evaluator.eval_action(get_rank())
 
     if world_size == 1 or dist is None or not dist.is_initialized():
         result_all = {
@@ -761,6 +795,7 @@ def evaluate(model, args, scene_filter=None):
             "ones_all": (sum(ones) / len(ones)).item() if len(ones) else 0.0,
             "length": len(sucs),
         }
+        result_all.update(summarize_ndtw(ndtws))
         print(result_all)
         if get_rank() == 0:
             with open(os.path.join(args.output_path, "result.json"), "a") as f:
@@ -773,16 +808,19 @@ def evaluate(model, args, scene_filter=None):
     spls_all = [torch.zeros(ep_num_all[i], dtype=spls.dtype).to(spls.device) for i in range(world_size)]
     oss_all = [torch.zeros(ep_num_all[i], dtype=oss.dtype).to(oss.device) for i in range(world_size)]
     ones_all = [torch.zeros(ep_num_all[i], dtype=ones.dtype).to(ones.device) for i in range(world_size)]
+    ndtws_all = [torch.zeros(ep_num_all[i], dtype=ndtws.dtype).to(ndtws.device) for i in range(world_size)]
     dist.barrier()
     dist.all_gather(sucs_all, sucs)
     dist.all_gather(spls_all, spls)
     dist.all_gather(oss_all, oss)
     dist.all_gather(ones_all, ones)
+    dist.all_gather(ndtws_all, ndtws)
     dist.barrier()
     sucs_all = torch.cat(sucs_all, dim=0)
     spls_all = torch.cat(spls_all, dim=0)
     oss_all = torch.cat(oss_all, dim=0)
     ones_all = torch.cat(ones_all, dim=0)
+    ndtws_all = torch.cat(ndtws_all, dim=0)
     result_all = {
         "sucs_all": (sum(sucs_all) / len(sucs_all)).item(),
         "spls_all": (sum(spls_all) / len(spls_all)).item(),
@@ -790,6 +828,7 @@ def evaluate(model, args, scene_filter=None):
         "ones_all": (sum(ones_all) / len(ones_all)).item(),
         "length": len(sucs_all),
     }
+    result_all.update(summarize_ndtw(ndtws_all))
     print(result_all)
     if get_rank() == 0:
         with open(os.path.join(args.output_path, "result.json"), "a") as f:
