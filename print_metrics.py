@@ -10,6 +10,7 @@ MAIN_METRICS = (
     ("spl", "SPL", ".4f"),
     ("os", "OS", ".4f"),
     ("ne", "NE", ".4f"),
+    ("ndtw", "nDTW", ".4f"),
     ("steps", "Steps", ".2f"),
 )
 
