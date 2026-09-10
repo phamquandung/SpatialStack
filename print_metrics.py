@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 import argparse
 import json
+import math
 from collections import defaultdict
 from pathlib import Path
 
@@ -49,7 +50,7 @@ def numeric_values(rows, key):
     values = []
     for row in rows:
         value = row.get(key)
-        if isinstance(value, (int, float)):
+        if isinstance(value, (int, float)) and math.isfinite(value):
             values.append(float(value))
     return values
 
@@ -59,10 +60,12 @@ def calculate_metrics(rows):
         "episodes": len(rows),
         "episode_min": min((row["episode_id"] for row in rows), default=None),
         "episode_max": max((row["episode_id"] for row in rows), default=None),
+        "counts": {},
     }
 
     for key, _, _ in MAIN_METRICS:
         values = numeric_values(rows, key)
+        metrics["counts"][key] = len(values)
         if values:
             metrics[key] = mean(values)
 
@@ -92,7 +95,11 @@ def print_metric_block(title, metrics, show_extras):
 
     for key, label, spec in MAIN_METRICS:
         if key in metrics:
-            print(f"  {label:<8} : {format_value(metrics[key], spec)}")
+            count = metrics["counts"][key]
+            coverage = f" ({count}/{metrics['episodes']} valid)" if count < metrics["episodes"] else ""
+            print(f"  {label:<8} : {format_value(metrics[key], spec)}{coverage}")
+        elif metrics["episodes"]:
+            print(f"  {label:<8} : N/A (0/{metrics['episodes']} valid)")
 
     if show_extras and metrics["extras"]:
         print("  Extra")
@@ -138,9 +145,25 @@ def print_metrics(episodes, aggregate_records, show_by_scene, show_extras):
             print_aggregate_record(aggregate_records[-1])
         return
 
+    # Use the same valid episode set for every metric and scene summary.
+    total = len(episodes)
+    episodes = [
+        row for row in episodes
+        if all(
+            isinstance(row.get(key), (int, float)) and math.isfinite(row[key])
+            for key in ("spl", "ne")
+        )
+    ]
+    skipped = total - len(episodes)
+    if skipped:
+        print(f"Skipped {skipped}/{total} episodes with invalid SPL or NE.")
+    if not episodes:
+        print("No valid episodes remain.")
+        return
+
     print_metric_block("Overall metrics", calculate_metrics(episodes), show_extras)
 
-    if aggregate_records:
+    if aggregate_records and not skipped:
         print()
         print_aggregate_record(aggregate_records[-1])
 
