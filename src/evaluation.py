@@ -716,8 +716,6 @@ class VLNEvaluator:
                     "ne": metrics["distance_to_goal"],
                     "ndtw": ep_ndtw,
                     "steps": step_id,
-                    "actions": ep_actions,
-                    "positions": ep_positions,
                     "episode_instruction": episode_instruction,
                     "peak_vggt_kv_mb": ep_peak_vggt_kv,
                     "peak_vggt_camera_kv_mb": ep_peak_vggt_camera_kv,
@@ -729,6 +727,13 @@ class VLNEvaluator:
                     "mean_vggt_ms": float(np.mean(vggt_times_ms)) if vggt_times_ms else 0.0,
                     "episode_time_s": time.perf_counter() - ep_t0,
                 }
+                # The per-step action and position traces dominate the result file on long
+                # episodes (74% of a 4 MB RxR run) and nothing downstream reads them: nDTW
+                # comes from the habitat metrics, and teacher-forcing reads its ground truth
+                # from a separate file. Opt in when a trajectory dump is actually needed.
+                if os.environ.get("VLN_SAVE_TRAJECTORY", "0") == "1":
+                    result["actions"] = ep_actions
+                    result["positions"] = ep_positions
                 if self.teacher_forced:
                     result["tf_action_acc"] = tf_correct / tf_total if tf_total else 0.0
                     result["tf_steps"] = tf_total
