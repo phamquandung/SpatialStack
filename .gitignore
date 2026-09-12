@@ -23,3 +23,7 @@ habitat*
 !src/habitat_extensions/
 !src/habitat_extensions/task.py
 !scripts/evaluation/
+
+ros2_ws/build/
+ros2_ws/install/
+ros2_ws/log/
