@@ -498,7 +498,7 @@ class VLNEvaluator:
         for episode in env.episodes:
             scene_episode_dict.setdefault(episode.scene_id, []).append(episode)
 
-        sucs, spls, oss, ones = [], [], [], []
+        sucs, spls, oss, ones, ndtws = [], [], [], [], []
         done_res = []
         result_path = os.path.join(self.output_path, "result.json")
         if os.path.exists(result_path):
@@ -517,6 +517,8 @@ class VLNEvaluator:
                         spls.append(res["spl"])
                         oss.append(res["os"])
                         ones.append(res["ne"])
+                        if "ndtw" in res:
+                            ndtws.append(res["ndtw"])
 
         for scene in sorted(scene_episode_dict.keys()):
             episodes = scene_episode_dict[scene]
@@ -650,10 +652,15 @@ class VLNEvaluator:
                 spls.append(metrics["spl"])
                 oss.append(metrics["oracle_success"])
                 ones.append(metrics["distance_to_goal"])
-                print(
+                if "ndtw" in metrics:
+                    ndtws.append(metrics["ndtw"])
+                metric_msg = (
                     f"scene_episode {scene_id}_{episode_id} success: {metrics['success']}, "
                     f"spl: {metrics['spl']}, os: {metrics['oracle_success']}, ne: {metrics['distance_to_goal']}"
                 )
+                if "ndtw" in metrics:
+                    metric_msg += f", ndtw: {metrics['ndtw']}"
+                print(metric_msg)
                 result = {
                     "scene_id": scene_id,
                     "episode_id": episode_id,
@@ -661,6 +668,7 @@ class VLNEvaluator:
                     "spl": metrics["spl"],
                     "os": metrics["oracle_success"],
                     "ne": metrics["distance_to_goal"],
+                    **({"ndtw": metrics["ndtw"]} if "ndtw" in metrics else {}),
                     "steps": step_id,
                     "episode_instruction": episode_instruction,
                     "peak_vggt_kv_mb": ep_peak_vggt_kv,
@@ -688,6 +696,7 @@ class VLNEvaluator:
             torch.tensor(spls).to(self.device),
             torch.tensor(oss).to(self.device),
             torch.tensor(ones).to(self.device),
+            torch.tensor(ndtws).to(self.device),
             torch.tensor(len(sucs)).to(self.device),
         )
 
@@ -704,7 +713,7 @@ def evaluate(model, args, scene_filter=None):
         args=args,
         scene_filter=scene_filter,
     )
-    sucs, spls, oss, ones, ep_num = evaluator.eval_action(get_rank())
+    sucs, spls, oss, ones, ndtws, ep_num = evaluator.eval_action(get_rank())
 
     if world_size == 1 or dist is None or not dist.is_initialized():
         result_all = {
@@ -712,6 +721,7 @@ def evaluate(model, args, scene_filter=None):
             "spls_all": (sum(spls) / len(spls)).item() if len(spls) else 0.0,
             "oss_all": (sum(oss) / len(oss)).item() if len(oss) else 0.0,
             "ones_all": (sum(ones) / len(ones)).item() if len(ones) else 0.0,
+            **({"ndtws_all": (sum(ndtws) / len(ndtws)).item()} if len(ndtws) else {}),
             "length": len(sucs),
         }
         print(result_all)
@@ -726,21 +736,28 @@ def evaluate(model, args, scene_filter=None):
     spls_all = [torch.zeros(ep_num_all[i], dtype=spls.dtype).to(spls.device) for i in range(world_size)]
     oss_all = [torch.zeros(ep_num_all[i], dtype=oss.dtype).to(oss.device) for i in range(world_size)]
     ones_all = [torch.zeros(ep_num_all[i], dtype=ones.dtype).to(ones.device) for i in range(world_size)]
+    ndtw_num = torch.tensor(len(ndtws), device=ep_num.device, dtype=ep_num.dtype)
+    ndtw_num_all = [torch.zeros_like(ndtw_num) for _ in range(world_size)]
+    dist.all_gather(ndtw_num_all, ndtw_num)
+    ndtws_all = [torch.zeros(ndtw_num_all[i], dtype=ndtws.dtype).to(ndtws.device) for i in range(world_size)]
     dist.barrier()
     dist.all_gather(sucs_all, sucs)
     dist.all_gather(spls_all, spls)
     dist.all_gather(oss_all, oss)
     dist.all_gather(ones_all, ones)
+    dist.all_gather(ndtws_all, ndtws)
     dist.barrier()
     sucs_all = torch.cat(sucs_all, dim=0)
     spls_all = torch.cat(spls_all, dim=0)
     oss_all = torch.cat(oss_all, dim=0)
     ones_all = torch.cat(ones_all, dim=0)
+    ndtws_all = torch.cat(ndtws_all, dim=0) if any(int(n.item()) > 0 for n in ndtw_num_all) else torch.empty(0, device=ones.device)
     result_all = {
         "sucs_all": (sum(sucs_all) / len(sucs_all)).item(),
         "spls_all": (sum(spls_all) / len(spls_all)).item(),
         "oss_all": (sum(oss_all) / len(oss_all)).item(),
         "ones_all": (sum(ones_all) / len(ones_all)).item(),
+        **({"ndtws_all": (sum(ndtws_all) / len(ndtws_all)).item()} if len(ndtws_all) else {}),
         "length": len(sucs_all),
     }
     print(result_all)

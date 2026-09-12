@@ -1,0 +1,12 @@
+/home/anhnt298/Downloads/SpatialStack_RxR/ros2_ws/build/ros2_inference_model/CMakeFiles/uninstall.dir
+/home/anhnt298/Downloads/SpatialStack_RxR/ros2_ws/build/ros2_inference_model/CMakeFiles/ros2_inference_model_uninstall.dir
+/home/anhnt298/Downloads/SpatialStack_RxR/ros2_ws/build/ros2_inference_model/CMakeFiles/set_instruction_node.dir
+/home/anhnt298/Downloads/SpatialStack_RxR/ros2_ws/build/ros2_inference_model/CMakeFiles/ament_cmake_python_copy_ros2_inference_model.dir
+/home/anhnt298/Downloads/SpatialStack_RxR/ros2_ws/build/ros2_inference_model/CMakeFiles/ament_cmake_python_build_ros2_inference_model_egg.dir
+/home/anhnt298/Downloads/SpatialStack_RxR/ros2_ws/build/ros2_inference_model/CMakeFiles/test.dir
+/home/anhnt298/Downloads/SpatialStack_RxR/ros2_ws/build/ros2_inference_model/CMakeFiles/edit_cache.dir
+/home/anhnt298/Downloads/SpatialStack_RxR/ros2_ws/build/ros2_inference_model/CMakeFiles/rebuild_cache.dir
+/home/anhnt298/Downloads/SpatialStack_RxR/ros2_ws/build/ros2_inference_model/CMakeFiles/list_install_components.dir
+/home/anhnt298/Downloads/SpatialStack_RxR/ros2_ws/build/ros2_inference_model/CMakeFiles/install.dir
+/home/anhnt298/Downloads/SpatialStack_RxR/ros2_ws/build/ros2_inference_model/CMakeFiles/install/local.dir
+/home/anhnt298/Downloads/SpatialStack_RxR/ros2_ws/build/ros2_inference_model/CMakeFiles/install/strip.dir

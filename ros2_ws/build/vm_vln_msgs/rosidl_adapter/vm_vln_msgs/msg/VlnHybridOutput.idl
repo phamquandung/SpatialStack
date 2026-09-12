@@ -1,0 +1,34 @@
+// generated from rosidl_adapter/resource/msg.idl.em
+// with input from vm_vln_msgs/msg/VlnHybridOutput.msg
+// generated code does not contain a copyright notice
+
+#include "nav_msgs/msg/Path.idl"
+#include "std_msgs/msg/Header.idl"
+
+module vm_vln_msgs {
+  module msg {
+    module VlnHybridOutput_Constants {
+      const uint8 TRAJECTORY = 0;
+      const uint8 DISCRETE_ACTION = 1;
+      const uint8 STOP = 0;
+      const uint8 MOVE_FORWARD = 1;
+      const uint8 TURN_LEFT = 2;
+      const uint8 TURN_RIGHT = 3;
+    };
+    struct VlnHybridOutput {
+      std_msgs::msg::Header header;
+
+      uint32 step_index;
+
+      uint8 type_of_output;
+
+      @verbatim (language="comment", text=
+        "When mode == trajectory → use this field")
+      nav_msgs::msg::Path trajectory;
+
+      @verbatim (language="comment", text=
+        "When mode == discrete_action → use this field")
+      sequence<int32> action_codes;
+    };
+  };
+};

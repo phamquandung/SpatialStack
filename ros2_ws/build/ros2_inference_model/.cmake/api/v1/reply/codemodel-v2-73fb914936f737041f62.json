@@ -1,0 +1,97 @@
+{
+	"configurations" : 
+	[
+		{
+			"directories" : 
+			[
+				{
+					"build" : ".",
+					"hasInstallRule" : true,
+					"jsonFile" : "directory-.-46b9388d584b49aa0635.json",
+					"minimumCMakeVersion" : 
+					{
+						"string" : "3.12"
+					},
+					"projectIndex" : 0,
+					"source" : ".",
+					"targetIndexes" : 
+					[
+						0,
+						1,
+						2,
+						3,
+						4
+					]
+				}
+			],
+			"name" : "",
+			"projects" : 
+			[
+				{
+					"directoryIndexes" : 
+					[
+						0
+					],
+					"name" : "ros2_inference_model",
+					"targetIndexes" : 
+					[
+						0,
+						1,
+						2,
+						3,
+						4
+					]
+				}
+			],
+			"targets" : 
+			[
+				{
+					"directoryIndex" : 0,
+					"id" : "ament_cmake_python_build_ros2_inference_model_egg::@6890427a1f51a3e7e1df",
+					"jsonFile" : "target-ament_cmake_python_build_ros2_inference_model_egg-98fd5f9f8cd3dec03a32.json",
+					"name" : "ament_cmake_python_build_ros2_inference_model_egg",
+					"projectIndex" : 0
+				},
+				{
+					"directoryIndex" : 0,
+					"id" : "ament_cmake_python_copy_ros2_inference_model::@6890427a1f51a3e7e1df",
+					"jsonFile" : "target-ament_cmake_python_copy_ros2_inference_model-ec1b68b733f733aed032.json",
+					"name" : "ament_cmake_python_copy_ros2_inference_model",
+					"projectIndex" : 0
+				},
+				{
+					"directoryIndex" : 0,
+					"id" : "ros2_inference_model_uninstall::@6890427a1f51a3e7e1df",
+					"jsonFile" : "target-ros2_inference_model_uninstall-aa47a5062e9b6ee2a43d.json",
+					"name" : "ros2_inference_model_uninstall",
+					"projectIndex" : 0
+				},
+				{
+					"directoryIndex" : 0,
+					"id" : "set_instruction_node::@6890427a1f51a3e7e1df",
+					"jsonFile" : "target-set_instruction_node-feb39a1cd47473bd8ac0.json",
+					"name" : "set_instruction_node",
+					"projectIndex" : 0
+				},
+				{
+					"directoryIndex" : 0,
+					"id" : "uninstall::@6890427a1f51a3e7e1df",
+					"jsonFile" : "target-uninstall-3b6e8acf193b360fcc3a.json",
+					"name" : "uninstall",
+					"projectIndex" : 0
+				}
+			]
+		}
+	],
+	"kind" : "codemodel",
+	"paths" : 
+	{
+		"build" : "/home/anhnt298/Downloads/SpatialStack_RxR/ros2_ws/build/ros2_inference_model",
+		"source" : "/home/anhnt298/Downloads/SpatialStack_RxR/ros2_ws/src/ros2_inference_model"
+	},
+	"version" : 
+	{
+		"major" : 2,
+		"minor" : 3
+	}
+}

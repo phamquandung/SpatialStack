@@ -54,5 +54,5 @@ habitat:
   dataset:
     type: R2RVLN-v1
     split: val_unseen
-    scenes_dir: /media/vmo-perception/disk_2/vinhld8/data/scene_datasets
-    data_path: /media/vmo-perception/disk_2/vinhld8/data/datasets/r2r/{split}/{split}.json.gz
+    scenes_dir: /storage/guest01/vinhld8/SpatialStack/data/scene_datasets
+    data_path: /storage/guest01/vinhld8/SpatialStack/data/datasets/r2r/{split}/{split}.json.gz

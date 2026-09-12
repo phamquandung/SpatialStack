@@ -50,12 +50,12 @@ habitat:
       ndtw:
         type: NDTW
         success_distance: 3.0
-        gt_path: /media/vmo-perception/disk_2/vinhld8/data/datasets/rxr/{split}/{split}_{role}_gt.json.gz # Change to your own path to the RXR dataset if you are not using the default path.
+        gt_path: /storage/guest01/vinhld8/SpatialStack/data/datasets/rxr/{split}/{split}_{role}_gt.json.gz # Change to your own path to the RXR dataset if you are not using the default path.
 
   dataset:
     type: RxRVLNCE-v1
     split: val_unseen
     roles: [guide]
-    languages: ["en-US"]
-    scenes_dir: /media/vmo-perception/disk_2/vinhld8/data/scene_datasets/ # Change to your own path to the RXR dataset if you are not using the default path.
-    data_path: /media/vmo-perception/disk_2/vinhld8/data/datasets/rxr/{split}/{split}_{role}.json.gz # Change to your own path to the RXR dataset if you are not using the default path.
+    languages: ["en-US", "en-IN"]
+    scenes_dir: /storage/guest01/vinhld8/SpatialStack/data/scene_datasets/ # Change to your own path to the RXR dataset if you are not using the default path.
+    data_path: /storage/guest01/vinhld8/SpatialStack/data/datasets/rxr/{split}/{split}_{role}.json.gz # Change to your own path to the RXR dataset if you are not using the default path.

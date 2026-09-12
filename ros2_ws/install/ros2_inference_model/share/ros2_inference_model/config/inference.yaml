@@ -1,0 +1,20 @@
+# set_instruction_topic / task_success_topic are shared by both nodes below
+# (the CLI publishes/subscribes the same pair the inference node
+# subscribes/publishes) and MUST be kept identical between the two blocks.
+# They're duplicated rather than using a YAML anchor because rcl's parameter
+# YAML parser rejects aliases ("Will not support aliasing").
+spatialstack_inference_node:
+  ros__parameters:
+    device: cuda:0
+    num_history: 8
+    max_new_tokens: 24
+
+    rgb_topic: /zed_x_mini/colored_image_compressed
+    set_instruction_topic: /vln/input/set_instruction
+    task_success_topic: /vln/output/task_success
+    output_topic: /vln_hybrid_output
+
+spatialstack_set_instruction_node:
+  ros__parameters:
+    set_instruction_topic: /vln/input/set_instruction
+    task_success_topic: /vln/output/task_success
