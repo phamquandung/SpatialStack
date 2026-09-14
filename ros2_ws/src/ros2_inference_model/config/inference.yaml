@@ -13,6 +13,7 @@ spatialstack_inference_node:
     set_instruction_topic: /vln/input/set_instruction
     task_success_topic: /vln/output/task_success
     output_topic: /vln_hybrid_output
+    action_done_topic: /vln_controller/action_done
 
 spatialstack_set_instruction_node:
   ros__parameters:

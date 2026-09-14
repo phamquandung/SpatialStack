@@ -21,7 +21,7 @@ import rclpy
 from rclpy.node import Node
 from ament_index_python.packages import get_package_share_directory, PackageNotFoundError
 from sensor_msgs.msg import CompressedImage
-from std_msgs.msg import String, Bool
+from std_msgs.msg import String, Bool, UInt32
 
 from vm_vln_msgs.msg import VlnHybridOutput
 
@@ -103,6 +103,7 @@ class SpatialStackInferenceNode(Node):
         self.declare_parameter("set_instruction_topic", cfg.get("set_instruction_topic", "/vln/input/set_instruction"))
         self.declare_parameter("task_success_topic", cfg.get("task_success_topic", "/vln/output/task_success"))
         self.declare_parameter("output_topic", cfg.get("output_topic", "/vln_hybrid_output"))
+        self.declare_parameter("action_done_topic", cfg.get("action_done_topic", "/vln_controller/action_done"))
 
         model_path = self.get_parameter("model_path").value
         if not model_path:
@@ -124,9 +125,11 @@ class SpatialStackInferenceNode(Node):
         set_instruction_topic = self.get_parameter("set_instruction_topic").value
         task_success_topic = self.get_parameter("task_success_topic").value
         output_topic = self.get_parameter("output_topic").value
+        action_done_topic = self.get_parameter("action_done_topic").value
 
         self.create_subscription(CompressedImage, rgb_topic, self._on_rgb, 10)
         self.create_subscription(String, set_instruction_topic, self._on_set_instruction, 10)
+        self.create_subscription(UInt32, action_done_topic, self._on_action_done, 10)
         self.task_success_pub = self.create_publisher(Bool, task_success_topic, 10)
         self.output_pub = self.create_publisher(VlnHybridOutput, output_topic, 10)
 
@@ -135,6 +138,13 @@ class SpatialStackInferenceNode(Node):
         self.current_instruction = None
         self.policy_init = False
         self.last_rgb_stamp = None
+
+        # Set by _on_action_done once the robot confirms a discrete step
+        # actually finished; _infer_loop waits on it before pulling the next
+        # frame, so the next inference never runs on an image captured before
+        # the previous action had any visible effect.
+        self.action_done_event = threading.Event()
+        self.last_done_step = None
 
         # Full trajectory history (PIL images). Never pruned: the model was
         # trained on linspace-subsampled history over the WHOLE episode so
@@ -157,6 +167,10 @@ class SpatialStackInferenceNode(Node):
         self.get_logger().info(f"New instruction: '{instruction}'")
         self.current_instruction = instruction
         self.policy_init = True
+
+    def _on_action_done(self, msg):
+        self.last_done_step = msg.data
+        self.action_done_event.set()
 
     def _on_rgb(self, msg):
         if self.current_instruction is None:
@@ -200,6 +214,8 @@ class SpatialStackInferenceNode(Node):
                 # before a newer instruction superseded this one); drop it.
                 continue
 
+            action = None
+            published_step = None
             try:
                 with self.lock:
                     if policy_init:
@@ -227,6 +243,8 @@ class SpatialStackInferenceNode(Node):
                         frame_indices=frame_indices,
                     )[0]
                     self.step_id += 1
+                    published_step = self.step_id
+                    self.action_done_event.clear()
                     self._publish_action(action)
 
                     if action == "STOP":
@@ -241,6 +259,21 @@ class SpatialStackInferenceNode(Node):
                         self.step_id = 0
             except Exception as e:
                 self.get_logger().error(f"Inference step failed: {e}")
+                continue
+
+            if action is not None and action != "STOP":
+                # Don't grab the next frame until the robot confirms this
+                # discrete step actually reached its goal -- otherwise the
+                # next inference would run on an image captured before this
+                # action had any visible effect (see hybrid_control_node's
+                # action-done ack on the control side). A robot that never
+                # reaches the goal (e.g. physically blocked) means the
+                # predicted action was wrong; that's on the model/operator to
+                # fix, not something to silently time out around here.
+                while rclpy.ok():
+                    if self.action_done_event.wait(timeout=1.0) and self.last_done_step == published_step:
+                        break
+                    self.action_done_event.clear()
 
     def _publish_task_success(self, success: bool):
         msg = Bool()
