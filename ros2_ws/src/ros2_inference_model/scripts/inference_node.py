@@ -104,6 +104,7 @@ class SpatialStackInferenceNode(Node):
         self.declare_parameter("task_success_topic", cfg.get("task_success_topic", "/vln/output/task_success"))
         self.declare_parameter("output_topic", cfg.get("output_topic", "/vln_hybrid_output"))
         self.declare_parameter("action_done_topic", cfg.get("action_done_topic", "/vln_controller/action_done"))
+        self.declare_parameter("action_sync_enabled", cfg.get("action_sync_enabled", True))
 
         model_path = self.get_parameter("model_path").value
         if not model_path:
@@ -126,6 +127,7 @@ class SpatialStackInferenceNode(Node):
         task_success_topic = self.get_parameter("task_success_topic").value
         output_topic = self.get_parameter("output_topic").value
         action_done_topic = self.get_parameter("action_done_topic").value
+        self.action_sync_enabled = bool(self.get_parameter("action_sync_enabled").value)
 
         self.create_subscription(CompressedImage, rgb_topic, self._on_rgb, 10)
         self.create_subscription(String, set_instruction_topic, self._on_set_instruction, 10)
@@ -261,15 +263,7 @@ class SpatialStackInferenceNode(Node):
                 self.get_logger().error(f"Inference step failed: {e}")
                 continue
 
-            if action is not None and action != "STOP":
-                # Don't grab the next frame until the robot confirms this
-                # discrete step actually reached its goal -- otherwise the
-                # next inference would run on an image captured before this
-                # action had any visible effect (see hybrid_control_node's
-                # action-done ack on the control side). A robot that never
-                # reaches the goal (e.g. physically blocked) means the
-                # predicted action was wrong; that's on the model/operator to
-                # fix, not something to silently time out around here.
+            if self.action_sync_enabled and action is not None and action != "STOP":
                 while rclpy.ok():
                     if self.action_done_event.wait(timeout=1.0) and self.last_done_step == published_step:
                         break
