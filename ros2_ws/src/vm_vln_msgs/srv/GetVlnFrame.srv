@@ -1,0 +1,6 @@
+# Fetch the exact camera frame that was fed into inference for a given step
+# (matches VlnHybridOutput.step_index published on /vln_hybrid_output).
+uint32 step_index
+---
+bool success
+sensor_msgs/CompressedImage image

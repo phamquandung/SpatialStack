@@ -16,6 +16,7 @@ find_package(sensor_msgs REQUIRED)
 rosidl_generate_interfaces(
   ${PROJECT_NAME}
     "msg/VlnHybridOutput.msg"
+    "srv/GetVlnFrame.srv"
   DEPENDENCIES
     nav_msgs
     sensor_msgs

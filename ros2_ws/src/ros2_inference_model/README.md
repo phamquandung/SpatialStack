@@ -112,6 +112,21 @@ All defined in [`config/inference.yaml`](config/inference.yaml):
 | `device` | `cuda:0` | — | — | Torch device |
 | `num_history` | `8` | — | — | Matches `eval_janus_vln.sh`'s `--num_history` |
 | `max_new_tokens` | `24` | — | — | Generation length cap |
+| `get_frame_service` | `/vln/get_frame` | `vm_vln_msgs/GetVlnFrame` | service | On-demand lookup of the frame a given `step_index` was inferred from (see below) |
+| `frame_jpeg_quality` | `85` | — | — | JPEG quality used when encoding a frame for `get_frame_service` |
+
+## Frame retrieval (`get_frame_service`)
+
+`rgb_list` (the per-episode history used for inference) is kept in full for
+the whole episode anyway — see below — so it already holds every frame ever
+fed to the model, indexed by `step_index`. `get_frame_service` just exposes a
+read of that list: call it with the `step_index` from a `VlnHybridOutput`
+message and it JPEG-encodes and returns `rgb_list[step_index - 1]`, the exact
+frame that step's action was predicted from. Nothing is streamed — the frame
+is only encoded when a request comes in, so this adds no load to the normal
+`output_topic` traffic. The web UI's "recent actions" panel uses this to
+show the frame for a clicked action on demand instead of streaming every
+frame to the browser.
 
 ## Behavior notes
 

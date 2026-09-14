@@ -17,6 +17,9 @@ spatialstack_inference_node:
 
     action_sync_enabled: true
 
+    get_frame_service: /vln/get_frame
+    frame_jpeg_quality: 85
+
 spatialstack_set_instruction_node:
   ros__parameters:
     set_instruction_topic: /vln/input/set_instruction

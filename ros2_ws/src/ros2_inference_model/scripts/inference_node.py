@@ -7,6 +7,7 @@ geometry, frame-strict windowing, history subsampling - never drifts from the
 Habitat evaluator. The per-step logic below mirrors VLNEvaluator.eval_action
 in that file; keep them in sync if that loop changes.
 """
+import io
 import os
 import sys
 import threading
@@ -24,6 +25,7 @@ from sensor_msgs.msg import CompressedImage
 from std_msgs.msg import String, Bool, UInt32
 
 from vm_vln_msgs.msg import VlnHybridOutput
+from vm_vln_msgs.srv import GetVlnFrame
 
 
 def _load_config_defaults(node_name: str) -> dict:
@@ -105,6 +107,8 @@ class SpatialStackInferenceNode(Node):
         self.declare_parameter("output_topic", cfg.get("output_topic", "/vln_hybrid_output"))
         self.declare_parameter("action_done_topic", cfg.get("action_done_topic", "/vln_controller/action_done"))
         self.declare_parameter("action_sync_enabled", cfg.get("action_sync_enabled", True))
+        self.declare_parameter("get_frame_service", cfg.get("get_frame_service", "/vln/get_frame"))
+        self.declare_parameter("frame_jpeg_quality", cfg.get("frame_jpeg_quality", 85))
 
         model_path = self.get_parameter("model_path").value
         if not model_path:
@@ -128,12 +132,19 @@ class SpatialStackInferenceNode(Node):
         output_topic = self.get_parameter("output_topic").value
         action_done_topic = self.get_parameter("action_done_topic").value
         self.action_sync_enabled = bool(self.get_parameter("action_sync_enabled").value)
+        get_frame_service = self.get_parameter("get_frame_service").value
+        self.frame_jpeg_quality = int(self.get_parameter("frame_jpeg_quality").value)
 
         self.create_subscription(CompressedImage, rgb_topic, self._on_rgb, 10)
         self.create_subscription(String, set_instruction_topic, self._on_set_instruction, 10)
         self.create_subscription(UInt32, action_done_topic, self._on_action_done, 10)
         self.task_success_pub = self.create_publisher(Bool, task_success_topic, 10)
         self.output_pub = self.create_publisher(VlnHybridOutput, output_topic, 10)
+        # On-demand lookup of the exact frame a given step_index was inferred
+        # from (self.rgb_list below), for the web UI's "click an action to see
+        # its frame" panel. Not streamed - only encoded/sent when requested,
+        # so it stays out of the live rosbridge traffic.
+        self.create_service(GetVlnFrame, get_frame_service, self._handle_get_frame)
 
         self.lock = threading.Lock()
         self.infer_queue = queue.Queue(maxsize=1)  # only the latest frame matters
@@ -268,6 +279,26 @@ class SpatialStackInferenceNode(Node):
                     if self.action_done_event.wait(timeout=1.0) and self.last_done_step == published_step:
                         break
                     self.action_done_event.clear()
+
+    def _handle_get_frame(self, request, response):
+        # rgb_list[i] is the frame appended for step_index (i + 1) - see
+        # _infer_loop: append happens, then step_id increments, then that new
+        # step_id is published. Grab the reference under the lock (cheap) and
+        # JPEG-encode outside it, so a slow encode never stalls inference.
+        with self.lock:
+            idx = request.step_index - 1
+            frame = self.rgb_list[idx] if 0 <= idx < len(self.rgb_list) else None
+
+        if frame is None:
+            response.success = False
+            return response
+
+        buf = io.BytesIO()
+        frame.save(buf, format="JPEG", quality=self.frame_jpeg_quality)
+        response.success = True
+        response.image.format = "jpeg"
+        response.image.data = buf.getvalue()
+        return response
 
     def _publish_task_success(self, success: bool):
         msg = Bool()
